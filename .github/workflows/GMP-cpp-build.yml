@@ -367,6 +367,74 @@ jobs:
                   }
               }.GetNewClosure()
 
+              # ---------------------------------------------------------------------
+              # Private upstream APIs that are NOT part of this public checkout:
+              #   LegitimacyAPI.h  (ros-patches component, disabled in components/config.lua,
+              #                     and its dependency gets stripped by the premake retry below)
+              #   FoxApi.h         (private anti-cheat state API used by glue + font-renderer)
+              # MSBuild failed with C1083 "Cannot open include file" for both of them.
+              # We generate self-contained inline stubs (so there is nothing to link against)
+              # and redirect the includes to them. NOTE: this is a hashtable-free, array-based
+              # writer on purpose: a nested here-string would terminate the outer one.
+              # ---------------------------------------------------------------------
+              Invoke-LogSection 'GMP private API stubs (LegitimacyAPI / FoxApi)' {
+                  $root = $context.ProjectRoot
+                  $shared = Join-Path $root 'code\client\shared'
+                  $components = Join-Path $root 'code\components'
+                  if (-not (Test-Path -LiteralPath $shared -PathType Container)) { throw "Missing include directory: $shared" }
+                  if (-not (Test-Path -LiteralPath $components -PathType Container)) { throw "Missing components directory: $components" }
+
+                  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+                  $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+
+                  $stubLegit = @(
+                      '#pragma once',
+                      '// GMP CI stub for the private ros-patches LegitimacyAPI.h (not in the public tree).',
+                      '#include <string>',
+                      '',
+                      'namespace ros',
+                      '{',
+                      '    inline std::string GetEntitlementSource() { return std::string(); }',
+                      '    inline std::string GetApiIdentifier() { return std::string(); }',
+                      '}'
+                  )
+                  $stubFox = @(
+                      '#pragma once',
+                      '// GMP CI stub for the private FoxApi.h (not in the public tree).',
+                      'inline bool getXState() { return false; }',
+                      'inline bool getFaceItState() { return false; }'
+                  )
+                  [System.IO.File]::WriteAllText((Join-Path $shared 'GmpLegitimacyStub.h'), (($stubLegit -join "`n") + "`n"), $utf8NoBom)
+                  [System.IO.File]::WriteAllText((Join-Path $shared 'FoxApi.h'), (($stubFox -join "`n") + "`n"), $utf8NoBom)
+                  Write-Host "  wrote stub: code\client\shared\GmpLegitimacyStub.h"
+                  Write-Host "  wrote stub: code\client\shared\FoxApi.h"
+
+                  # Redirect <LegitimacyAPI.h> (net, discord, glue, fxdk-main, ...) to the stub.
+                  # ros-patches-* are skipped: they provide the real implementation and are not built here.
+                  $patched = 0
+                  $sources = @(Get-ChildItem -LiteralPath $components -Recurse -File -ErrorAction SilentlyContinue |
+                      Where-Object {
+                          $_.Extension -in @('.cpp', '.cc', '.h', '.hpp', '.inl') -and
+                          $_.FullName -notmatch '\\(node_modules|ros-patches-[A-Za-z0-9]+)\\'
+                      })
+                  foreach ($file in $sources) {
+                      $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+                      $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+                      $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                      if ($hasBom) { $text = $text.Substring(1) }
+                      if ($text -notmatch '#\s*include\s*<LegitimacyAPI\.h>') { continue }
+                      $new = [regex]::Replace($text, '#\s*include\s*<LegitimacyAPI\.h>', '#include <GmpLegitimacyStub.h>')
+                      $enc = if ($hasBom) { $utf8Bom } else { $utf8NoBom }
+                      [System.IO.File]::WriteAllText($file.FullName, $new, $enc)
+                      Write-Host "  redirected LegitimacyAPI.h: $($file.FullName.Substring($root.Length + 1))"
+                      $patched++
+                  }
+                  Write-Host "Files redirected to the LegitimacyAPI stub: $patched"
+                  if ($patched -eq 0) {
+                      Write-Host 'No LegitimacyAPI.h includes found (already patched or not used).'
+                  }
+              }.GetNewClosure()
+
               Invoke-LogSection 'Premake project generation' {
                   $root = $context.ProjectRoot
                   $codeDir = Join-Path $root 'code'

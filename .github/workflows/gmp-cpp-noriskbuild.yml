@@ -10,6 +10,10 @@ on:
         description: 'Stop after premake project generation succeeds (fast check, skips MSBuild/UI/artifacts)'
         type: boolean
         default: false
+      ui_only:
+        description: 'Stop after the UI build succeeds (fast check, skips the ~50 min MSBuild/artifacts)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,6 +40,7 @@ jobs:
       CFX_FEATURE_BRANCH_BUILD: 'false'
       MSYS2_ROOT: 'C:\msys64'
       GMP_PREMAKE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.premake_only == true) && 'true' || 'false' }}
+      GMP_UI_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.ui_only == true) && 'true' || 'false' }}
 
     steps:
       # MSYS2 recommends disabling automatic CRLF conversion before checkout.
@@ -572,6 +577,109 @@ jobs:
                   return
               }
 
+              # ---------------------------------------------------------------------
+              # UI build (runs BEFORE the long MSBuild so a UI problem fails in minutes, not after ~50 min)
+              #
+              # Root cause of the old failure ("Couldn't find a package.json file in ext\cfx-ui"):
+              #   ext/ui-build/build.cmd in this fork builds the menu from ext/cfx-ui, but that folder
+              #   only holds 2 stub .ts files in the public tree. The real UI is a private repo that is
+              #   cloned there only when VMP_UI_URI is set (uiReplace.psm1), which it is not in this CI.
+              # Fix: if ext/cfx-ui has no package.json, use the upstream build.cmd that downloads the
+              #   prebuilt UI bundle (same as upstream FiveM) and build only the loadscreen locally.
+              #   If a real UI is present (package.json exists) the repo's own build.cmd is used as is.
+              # ---------------------------------------------------------------------
+              Invoke-LogSection 'UI build (with prebuilt-bundle fallback)' {
+                  $root = $context.ProjectRoot
+                  $uiSrc = Join-Path $root 'ext\cfx-ui\package.json'
+                  $buildCmd = Join-Path $root 'ext\ui-build\build.cmd'
+                  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+                  if (Test-Path -LiteralPath $uiSrc -PathType Leaf) {
+                      Write-Host 'ext\cfx-ui\package.json found: using the repository build.cmd (build UI from source).'
+                  }
+                  else {
+                      Write-Host 'ext\cfx-ui\package.json NOT found (public tree has only stub files): switching ext\ui-build\build.cmd to the prebuilt UI bundle download.'
+                      $cmdLines = @(
+                          '@echo off',
+                          'SETLOCAL EnableDelayedExpansion',
+                          '',
+                          'set GAME=%1',
+                          'SET UI_BUNDLE=cfx-ui-%GAME%.zip',
+                          'SET UI_BIG_BUNDLE=cfx-ui-%GAME%_big.zip',
+                          '',
+                          'if "%GAME%"=="five" (',
+                          '    set UI_URL=https://downloads.cfx-services.net/prod/019e6f02-87a9-76ec-86de-c637aee18c01',
+                          '    set UI_BIG_URL=https://downloads.cfx-services.net/prod/019e6f02-8c79-7d6d-acdf-5b874698c91c',
+                          ') else if "%GAME%"=="rdr3" (',
+                          '    set UI_URL=https://downloads.cfx-services.net/prod/019e6f02-8e48-7f30-9339-bc6b1fe0f6d3',
+                          '    set UI_BIG_URL=https://downloads.cfx-services.net/prod/019e6f02-90c5-7499-975a-88da5cfc8322',
+                          ') else (',
+                          '    echo Invalid game specified: %GAME%',
+                          '    exit /b 1',
+                          ')',
+                          '',
+                          'where /q yarn || exit /b !ERRORLEVEL!',
+                          '',
+                          'echo Building loading screen...',
+                          'pushd loadscreen',
+                          'call yarn || exit /b !ERRORLEVEL!',
+                          'call node_modules\.bin\webpack || exit /b !ERRORLEVEL!',
+                          'echo Copying loadscreen files...',
+                          'xcopy /y /e dist\*.* %~dp0\data\loadscreen\ || exit /b !ERRORLEVEL!',
+                          'popd',
+                          '',
+                          'if exist %~dp0\data\app ( rmdir /s /q %~dp0\data\app\ )',
+                          'if exist %~dp0\data_big\app ( rmdir /s /q %~dp0\data_big\app\ )',
+                          '',
+                          'echo Moving loadscreen large files to data_big...',
+                          'mkdir %~dp0\data_big\loadscreen',
+                          'move /y %~dp0\data\loadscreen\*.jpg %~dp0\data_big\loadscreen\',
+                          '',
+                          'powershell -ExecutionPolicy Unrestricted .\make_dates.ps1 %~dp0\data',
+                          'powershell -ExecutionPolicy Unrestricted .\make_dates.ps1 %~dp0\data_big',
+                          '',
+                          'if exist %~dp0\data.zip ( del %~dp0\data.zip )',
+                          'if exist %~dp0\data_big.zip ( del %~dp0\data_big.zip )',
+                          '',
+                          'echo Downloading UI bundle...',
+                          'curl.exe -k --fail-with-body --retry 5 --retry-delay 5 -L -o%UI_BUNDLE% %UI_URL% || exit /b !ERRORLEVEL!',
+                          'echo Downloading UI big bundle...',
+                          'curl.exe -k --fail-with-body --retry 5 --retry-delay 5 -L -o%UI_BIG_BUNDLE% %UI_BIG_URL% || exit /b !ERRORLEVEL!',
+                          '',
+                          'copy /y %~dp0\%UI_BUNDLE% %~dp0\data.zip || exit /b !ERRORLEVEL!',
+                          'copy /y %~dp0\%UI_BIG_BUNDLE% %~dp0\data_big.zip || exit /b !ERRORLEVEL!',
+                          '',
+                          '%~dp0\..\..\code\tools\ci\7z u -mx=0 %~dp0\data.zip %~dp0\data\* || exit /b !ERRORLEVEL!',
+                          '%~dp0\..\..\code\tools\ci\7z u -mx=0 %~dp0\data_big.zip %~dp0\data_big\* || exit /b !ERRORLEVEL!',
+                          '',
+                          'exit /B 0'
+                      )
+                      [System.IO.File]::WriteAllText($buildCmd, (($cmdLines -join "`r`n") + "`r`n"), $utf8NoBom)
+                      Write-Host "  wrote: ext\ui-build\build.cmd"
+                  }
+
+                  # Always rebuild: never trust a stale data\.commit marker or old zips.
+                  $uiBuildDir = Join-Path $root 'ext\ui-build'
+                  Remove-Item -LiteralPath (Join-Path $uiBuildDir 'data\.commit') -Force -ErrorAction SilentlyContinue
+                  Remove-Item -LiteralPath (Join-Path $uiBuildDir 'data.zip') -Force -ErrorAction SilentlyContinue
+                  Remove-Item -LiteralPath (Join-Path $uiBuildDir 'data_big.zip') -Force -ErrorAction SilentlyContinue
+
+                  Invoke-BuildUI -Context $context -Versions $versions
+
+                  foreach ($z in @('data.zip', 'data_big.zip')) {
+                      $zp = Join-Path $uiBuildDir $z
+                      if (-not (Test-Path -LiteralPath $zp -PathType Leaf) -or (Get-Item -LiteralPath $zp).Length -lt 1KB) {
+                          throw "UI build finished but ext\ui-build\$z is missing or empty."
+                      }
+                      Write-Host ("  {0}: {1} bytes" -f $z, (Get-Item -LiteralPath $zp).Length)
+                  }
+              }.GetNewClosure()
+
+              if ($env:GMP_UI_ONLY -eq 'true') {
+                  Write-Host 'GMP_UI_ONLY=true: UI build succeeded; stopping before MSBuild.'
+                  return
+              }
+
               Invoke-LogSection 'Version resource generation' {
                   Invoke-UpdateVersionFiles -Context $context -Versions $versions
               }.GetNewClosure()
@@ -607,13 +715,7 @@ jobs:
                       throw "MSBuild did not produce any launcher executable under $binRoot (see the executable listing above; look for earlier 'error C' / 'error LNK' lines in the MSBuild log)."
                   }
                   Write-Host "Using launcher executable: $found"
-                  # The pack step may look for the product exe name; make it available there too.
-                  $expected = Join-Path $context.MSBuildOutput $context.ProductExeName
-                  if (-not [string]::Equals($found, $expected, [System.StringComparison]::OrdinalIgnoreCase)) {
-                      Copy-Item -LiteralPath $found -Destination $expected -Force
-                      Write-Host "Copied $found -> $expected"
-                  }
-                  $exePath = $expected
+                  $exePath = $found
               }
 
               $fileInfo = Get-Item -LiteralPath $exePath
@@ -656,11 +758,6 @@ jobs:
               }
 
               Write-Host "Client executable built: $exePath"
-
-              # Web UI (prebuilt UI bundle + loading screen -> ext\ui-build\data.zip / data_big.zip)
-              Invoke-LogSection 'Building UI' {
-                  Invoke-BuildUI -Context $context -Versions $versions
-              }.GetNewClosure()
 
               # Pack the client cache: <repo>\caches\fivereborn  (this is the folder you give to publish.bat)
               Invoke-LogSection 'Packing client cache' {
@@ -707,7 +804,7 @@ jobs:
           }
 
       - name: Upload GMP.exe
-        if: env.GMP_PREMAKE_ONLY != 'true'
+        if: env.GMP_PREMAKE_ONLY != 'true' && env.GMP_UI_ONLY != 'true'
         uses: actions/upload-artifact@v7.0.2
         with:
           name: GMP-exe-${{ github.run_number }}
@@ -719,7 +816,7 @@ jobs:
       # Download this artifact, extract it, then on the server run:
       #   publish.bat "<extracted>\fivereborn"
       - name: Upload GMP client cache (for publish.bat)
-        if: env.GMP_PREMAKE_ONLY != 'true'
+        if: env.GMP_PREMAKE_ONLY != 'true' && env.GMP_UI_ONLY != 'true'
         uses: actions/upload-artifact@v7.0.2
         with:
           name: GMP-client-cache-${{ github.run_number }}

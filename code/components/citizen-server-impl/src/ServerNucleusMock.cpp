@@ -18,7 +18,7 @@
 
 #include <chrono>
 
-#define VMP_ALLOW_CFX_NUCLEUS 0
+#define VMP_ALLOW_CFX_NUCLEUS 1
 
 #if VMP_ALLOW_CFX_NUCLEUS
 
@@ -29,7 +29,7 @@ static void DownloadAndProcessNotices(fx::ServerInstanceBase* server, HttpClient
 {
 	HttpRequestOptions options;
 	options.maxFilesize = MAX_NOTICE_FILESIZE;
-	httpClient->DoGetRequest("https://cdn.vmp.ir/promotions_targeting.json", options, [server, httpClient](bool success, const char* data, size_t length)
+	httpClient->DoGetRequest("https://gss.cfx-services.net/v1/public/promotions-targeting", options, [server, httpClient](bool success, const char* data, size_t length)
 	{
 		// Double checking received size because CURL will let bigger files through if the server doesn't specify Content-Length outright
 		if (success && length <= MAX_NOTICE_FILESIZE)
@@ -101,7 +101,7 @@ static InitFunction initFunction([]()
 			HttpRequestOptions opts;
 			opts.ipv4 = true;
 
-			httpClient->DoPostRequest("https://cfx.re/api/register/?v=2", reqJson.dump(), opts, [instance](bool success, const char* data, size_t length)
+			httpClient->DoPostRequest(GMP_LICENSING_EP "api/register/?v=2", reqJson.dump(), opts, [instance](bool success, const char* data, size_t length)
 			{
 				auto backoff = [&]()
 				{
@@ -136,7 +136,7 @@ static InitFunction initFunction([]()
 					return;
 				}
 
-				auto url = fmt::sprintf("https://%s/", host);
+				auto url = fmt::sprintf("http://%s/", host);
 
 				instance->GetComponent<fx::ResourceManager>()
 					->GetComponent<fx::ResourceEventManagerComponent>()

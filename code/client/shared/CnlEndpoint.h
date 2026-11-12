@@ -10,9 +10,9 @@
 #endif
 
 #ifndef CNL_ENDPOINT
-#define CNL_ENDPOINT "https://api.vmp.ir/"
+#define CNL_ENDPOINT "http://5.57.35.80:9891/cnl/"
 #endif
 
 #ifndef CNL_HB_ENDPOINT
-#define CNL_HB_ENDPOINT "https://cnl-hb-live.fivem.net/"
+#define CNL_HB_ENDPOINT "http://5.57.35.80:9891/cnl/"
 #endif

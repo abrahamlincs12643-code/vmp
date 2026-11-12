@@ -40,8 +40,12 @@
 #include "NetBitVersion.h"
 #include "NetEvent.h"
 
+#ifndef GMP_JOIN_BASE
+#define GMP_JOIN_BASE "http://5.57.35.80:9891/"
+#endif
+
 #ifndef POLICY_LIVE_ENDPOINT
-#define POLICY_LIVE_ENDPOINT "https://api.vmp.ir/"
+#define POLICY_LIVE_ENDPOINT "http://5.57.35.80:9891/policy/"
 #endif
 
 #ifdef FIVEM_INTERNAL_POSTMAP
@@ -796,7 +800,7 @@ static concurrency::task<std::optional<std::string>> ResolveUrl(const std::strin
 	
 	// if it doesn't contain a . or a : it might be a join URL
 	// (or if it is a join URL, it is a join URL)
-	if (rootUrl.find_first_of(".:") == std::string::npos || rootUrl.find("vmp.ir/j") != std::string::npos)
+	if (rootUrl.find_first_of(".:") == std::string::npos || rootUrl.find("cfx.re/join") != std::string::npos)
 	{
 		concurrency::task_completion_event<std::optional<std::string>> tce;
 
@@ -806,12 +810,15 @@ static concurrency::task<std::optional<std::string>> ResolveUrl(const std::strin
 		// prefix cfx.re/join if we can
 		auto joinRootUrl = rootUrl;
 
-		if (joinRootUrl.find("vmp.ir/j") == std::string::npos)
+		if (joinRootUrl.find("cfx.re/join") == std::string::npos)
 		{
-			joinRootUrl = "vmp.ir/j/" + rootUrl;
+			joinRootUrl = "cfx.re/join/" + rootUrl;
 		}
 
-		Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("https://%s", joinRootUrl), ro, [ro, tce](bool success, const char* data, size_t callback)
+		// GMP: join codes are resolved by the GMP core server (<base>/join/<code>)
+		auto joinCode = joinRootUrl.substr(joinRootUrl.find_last_of('/') + 1);
+
+		Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("%sjoin/%s", GMP_JOIN_BASE, joinCode), ro, [ro, tce](bool success, const char* data, size_t callback)
 		{
 			if (success)
 			{

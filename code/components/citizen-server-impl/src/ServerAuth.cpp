@@ -71,7 +71,7 @@ static InitFunction httpinitFunction([]()
 		auto done = std::make_shared<std::promise<void>>();
 		auto verdict = done->get_future();
 
-		httpClient->DoPostRequest(fmt::sprintf(LICENSING_EP "server/register.php?work=register"), jsonData.dump(), opts, [instance, tlm, done](bool success, const char* data, size_t length)
+		httpClient->DoPostRequest(fmt::sprintf(GMP_LICENSING_EP "server/register.php?work=register"), jsonData.dump(), opts, [instance, tlm, done](bool success, const char* data, size_t length)
 		{
 			auto body = (data && length) ? std::string(data, length) : std::string{};
 
@@ -84,8 +84,8 @@ static InitFunction httpinitFunction([]()
 			catch (const std::exception&)
 			{
 				RefuseToStart(success
-					? "The VMP licensing server returned a malformed response."
-					: "A connection with the VMP server could not be established!");
+					? "The GMP licensing server returned a malformed response."
+					: "A connection with the GMP server could not be established!");
 				return;
 			}
 
@@ -113,7 +113,7 @@ static InitFunction httpinitFunction([]()
 
 		if (verdict.wait_for(kLicenseTimeout + std::chrono::seconds(5)) != std::future_status::ready)
 		{
-			RefuseToStart("The VMP licensing server did not respond.");
+			RefuseToStart("The GMP licensing server did not respond.");
 			return;
 		}
 	},

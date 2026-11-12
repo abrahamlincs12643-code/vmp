@@ -527,7 +527,7 @@ static std::wstring UnblameCrash(const std::wstring& hash)
 
 	if (hash.find(L"GTAProcess") != std::string::npos ||
 		hash.find(L"GameProcess") != std::string::npos ||
-		_wcsnicmp(hash.c_str(), L"vmp.exe+", 10) == 0 ||
+		_wcsnicmp(hash.c_str(), L"gmp.exe+", 10) == 0 ||
 		_wcsnicmp(hash.c_str(), L"redm.exe+", 9) == 0)
 	{
 		auto baseGame = std::wstring_view{ GAME_EXECUTABLE };

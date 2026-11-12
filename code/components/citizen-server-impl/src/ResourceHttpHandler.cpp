@@ -340,7 +340,7 @@ static InitFunction initFunction([]()
 
 					if (startPos != std::string::npos)
 					{
-						auto webUrl = fmt::sprintf("https://vmp.ir/j/%s", wvvv.substr(startPos + 1, endPos - (startPos + 1)));
+						auto webUrl = fmt::sprintf("https://cfx.re/join/%s", wvvv.substr(startPos + 1, endPos - (startPos + 1)));
 
 						response->SetStatusCode(302);
 						response->SetHeader("Location", webUrl);

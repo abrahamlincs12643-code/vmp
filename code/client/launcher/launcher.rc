@@ -74,7 +74,7 @@ END
 #endif
 
 #if defined(GTA_FIVE)
-#define PRODUCT "VMP"
+#define PRODUCT "GMP"
 #elif defined(IS_RDR3)
 #define PRODUCT "RedM"
 #elif defined(GTA_NY)

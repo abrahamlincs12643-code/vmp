@@ -33,4 +33,12 @@ private:
 
 DECLARE_INSTANCE_TYPE(ServerLicensingComponent);
 
-#define LICENSING_EP "https://api.vmp.ir/"
+// GMP license registration and server-listing API origin. Keep the trailing slash.
+// Use HTTPS for production deployments.
+#ifndef GMP_LICENSING_EP
+#define GMP_LICENSING_EP "http://5.57.35.80:9891/"
+#endif
+
+// Kept for source compatibility with older code that referenced ATLAS_LICENSING_EP.
+#define ATLAS_LICENSING_EP GMP_LICENSING_EP
+#define LICENSING_EP GMP_LICENSING_EP

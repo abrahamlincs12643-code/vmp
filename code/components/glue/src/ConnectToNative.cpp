@@ -195,7 +195,7 @@ void saveSettings(const wchar_t *json) {
 	PWSTR appDataPath;
 	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appDataPath))) {
 		// create the directory if not existent
-		std::wstring cfxPath = std::wstring(appDataPath) + L"\\VMP";
+		std::wstring cfxPath = std::wstring(appDataPath) + L"\\GMP";
 		CreateDirectory(cfxPath.c_str(), nullptr);
 		// open and read the profile file
 		std::wstring settingsPath = cfxPath + L"\\settings.json";
@@ -211,7 +211,7 @@ void loadSettings() {
 	PWSTR appDataPath;
 	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appDataPath))) {
 		// create the directory if not existent
-		std::wstring cfxPath = std::wstring(appDataPath) + L"\\VMP";
+		std::wstring cfxPath = std::wstring(appDataPath) + L"\\GMP";
 		CreateDirectory(cfxPath.c_str(), nullptr);
 
 		// open and read the profile file
@@ -327,7 +327,7 @@ static void ConnectTo(const std::string& hostnameStr, bool fromUI = false, const
 
 	if (!hostnameStr.empty() && hostnameStr[0] == '-')
 	{
-		netLibrary->ConnectToServer("vmp.ir/j/" + hostnameStr.substr(1));
+		netLibrary->ConnectToServer("cfx.re/join/" + hostnameStr.substr(1));
 	}
 	else
 	{
@@ -1332,7 +1332,7 @@ static std::string foxState;
 					json[i]["address"].get_to(l.url);
 					l.vars = json[i]["vars"];
 
-					if (l.url.find("vmp.ir/j/") == 0)
+					if (l.url.find("cfx.re/join/") == 0)
 					{
 						l.url = "-" + l.url.substr(12);
 					}

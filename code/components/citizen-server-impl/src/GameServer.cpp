@@ -51,7 +51,7 @@
 #include "FormData.h"
 #include "Frame.h"
 
-constexpr const char kDefaultServerList[] = LICENSING_EP "server/heartbeat.php?work=heartbeat";
+constexpr const char kDefaultServerList[] = GMP_LICENSING_EP "server/heartbeat.php?work=heartbeat";
 
 static fx::GameServer* g_gameServer;
 

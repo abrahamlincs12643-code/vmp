@@ -622,6 +622,12 @@ jobs:
                   if (Test-Path -LiteralPath $uiSrc -PathType Leaf) {
                       Write-Host 'ext\cfx-ui\package.json found: using the repository build.cmd (build UI from source).'
                   }
+                  elseif ([System.IO.File]::ReadAllText($buildCmd) -match 'downloads\.cfx-services\.net') {
+                      # The repo's own ext\ui-build\build.cmd already downloads a prebuilt UI bundle
+                      # (e.g. the build-90 version copied from the GMP repo): keep it, do not overwrite it.
+                      Write-Host 'ext\cfx-ui\package.json not found, but ext\ui-build\build.cmd already downloads a prebuilt UI bundle: using the repository build.cmd as is.'
+                      Get-Content -LiteralPath $buildCmd | Where-Object { $_ -match 'downloads\.cfx-services\.net' } | ForEach-Object { Write-Host "  $($_.Trim())" }
+                  }
                   else {
                       Write-Host 'ext\cfx-ui\package.json NOT found (public tree has only stub files): switching ext\ui-build\build.cmd to the prebuilt UI bundle download.'
                       $cmdLines = @(
@@ -784,6 +790,14 @@ jobs:
 
               Write-Host "Client executable built: $exePath"
 
+              # Invoke-PackClient copies <MSBuildOutput>\<ProductExeName> (GMP.exe). The premake project in this
+              # tree emits the launcher as VMP.exe, so provide it under the expected name before packing.
+              $expectedExe = Join-Path $context.MSBuildOutput $context.ProductExeName
+              if (-not (Test-Path -LiteralPath $expectedExe -PathType Leaf)) {
+                  Copy-Item -LiteralPath $exePath -Destination $expectedExe -Force
+                  Write-Host "Copied launcher: $exePath -> $expectedExe"
+              }
+
               # Pack the client cache: <repo>\caches\fivereborn  (this is the folder you give to publish.bat)
               Invoke-LogSection 'Packing client cache' {
                   Invoke-PackClient -Context $context -Tools $tools -Versions $versions
@@ -809,6 +823,55 @@ jobs:
               throw
           }
           '@
+
+          # ---------------------------------------------------------------------
+          # CI-only patches of two helpers used by "Packing client cache". They must be applied here,
+          # before the build script starts, because `using module` loads the .psm1 files at parse time.
+          #  1) doSomething.psm1 (Invoke-Something) is a private post-pack step: it copies from C:\fox,
+          #     C:\EOS\EasyAntiCheat, C:\GameDownloader, runs VMProtect and writes to C:\example. None of
+          #     that exists on a GitHub-hosted runner, so it would abort the build right after packing.
+          #     It is left untouched when that environment really exists (e.g. a self-hosted runner).
+          #  2) cfxPackClient.psm1 runs signtool with a certificate thumbprint that is not installed
+          #     on the runner (spams "No certificates were found"): skipped when the cert is missing.
+          # ---------------------------------------------------------------------
+          $utf8NoBomOuter = [System.Text.UTF8Encoding]::new($false)
+          $doSomethingPath = Join-Path (Get-Location).Path 'psm1\doSomething.psm1'
+          $packClientPath = Join-Path (Get-Location).Path 'psm1\cfxPackClient.psm1'
+
+          $privateReady = (Test-Path -LiteralPath 'C:\fox') -and
+              (Test-Path -LiteralPath 'C:\EOS\EasyAntiCheat\start_protected_game.exe') -and
+              (Test-Path -LiteralPath 'C:\GameDownloader') -and
+              (Test-Path -LiteralPath 'C:\example') -and
+              (Test-Path -LiteralPath 'C:\Program Files\VMProtect Professional\VMProtect_Con.exe')
+          if ($privateReady) {
+              Write-Host 'Private post-pack environment found: keeping psm1\doSomething.psm1 unchanged.'
+          }
+          else {
+              Write-Host 'Private post-pack environment (C:\fox, C:\EOS, C:\GameDownloader, VMProtect) not found: replacing psm1\doSomething.psm1 with a no-op for this CI run.'
+              $noopLines = @(
+                  'using module .\cfxBuildContext.psm1',
+                  '',
+                  'function Invoke-Something {',
+                  '    param (',
+                  '        [CfxBuildContext] $Context,',
+                  '        [string] $PackRoot',
+                  '    )',
+                  '    Write-Host "Skipping private post-pack step (EasyAntiCheat / FoxG / GameDownloader / VMProtect): not available on this runner."',
+                  '}'
+              )
+              [System.IO.File]::WriteAllText($doSomethingPath, (($noopLines -join "`r`n") + "`r`n"), $utf8NoBomOuter)
+          }
+
+          $signCert = @(Get-ChildItem -Path 'Cert:\CurrentUser\My', 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Thumbprint -eq '644A24E302160046FDD8291DDC920EA5802B5659' })
+          if ($signCert.Count -eq 0) {
+              $packText = [System.IO.File]::ReadAllText($packClientPath)
+              $packNew = [regex]::Replace($packText, '(?m)^\s*&\s*signtool sign .*$', '                Write-Host "  (signing skipped: code-signing certificate not installed on this runner)"')
+              if ($packNew -ne $packText) {
+                  [System.IO.File]::WriteAllText($packClientPath, $packNew, $utf8NoBomOuter)
+                  Write-Host 'Code-signing certificate not found: signing skipped in psm1\cfxPackClient.psm1 for this CI run.'
+              }
+          }
 
           # Keep the generated script beside the psm1 folder so relative `using module`
           # paths resolve exactly as they do in the repository's own CI scripts.

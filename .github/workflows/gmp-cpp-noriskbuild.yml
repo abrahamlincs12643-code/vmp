@@ -14,6 +14,13 @@ on:
         description: 'Stop after the UI build succeeds (fast check, skips the ~50 min MSBuild/artifacts)'
         type: boolean
         default: false
+      ui_source:
+        description: 'Menu (mpMenu) source: prebuilt = upstream FiveM menu download (safest); old-source = restore ext/cfx-ui from git history (73e1e4b7c, last full source) and build it, so you can rebrand it'
+        type: choice
+        options:
+          - prebuilt
+          - old-source
+        default: prebuilt
 
 permissions:
   contents: read
@@ -41,6 +48,7 @@ jobs:
       MSYS2_ROOT: 'C:\msys64'
       GMP_PREMAKE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.premake_only == true) && 'true' || 'false' }}
       GMP_UI_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.ui_only == true) && 'true' || 'false' }}
+      GMP_UI_SOURCE: ${{ (github.event_name == 'workflow_dispatch' && inputs.ui_source) || 'prebuilt' }}
 
     steps:
       # MSYS2 recommends disabling automatic CRLF conversion before checkout.
@@ -593,6 +601,23 @@ jobs:
                   $uiSrc = Join-Path $root 'ext\cfx-ui\package.json'
                   $buildCmd = Join-Path $root 'ext\ui-build\build.cmd'
                   $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+                  if ($env:GMP_UI_SOURCE -eq 'old-source' -and -not (Test-Path -LiteralPath $uiSrc -PathType Leaf)) {
+                      # Upstream deleted ext/cfx-ui in commit 06efa442c (2026.2 update). The last commit that still
+                      # had the full menu source is its parent, 73e1e4b7c (full history is available: fetch-depth 0).
+                      $oldUiCommit = '73e1e4b7c9600ee31b816f0064ff476901c577a9'
+                      Write-Host "GMP_UI_SOURCE=old-source: restoring ext/cfx-ui from $oldUiCommit"
+                      & git -C $root cat-file -e "$oldUiCommit^{commit}"
+                      if ($LASTEXITCODE -ne 0) { throw "Commit $oldUiCommit is not in the checkout history." }
+                      & git -C $root checkout $oldUiCommit -- ext/cfx-ui
+                      if ($LASTEXITCODE -ne 0) { throw 'git checkout of ext/cfx-ui from history failed.' }
+                      if (-not (Test-Path -LiteralPath $uiSrc -PathType Leaf)) { throw 'ext\cfx-ui\package.json still missing after restore.' }
+                      # CI only needs the build; unit tests of a 5-month-old tree must not block the client build.
+                      $bc = [System.IO.File]::ReadAllText($buildCmd)
+                      $bc = [regex]::Replace($bc, '(?m)^call yarn test.*\r?\n', '')
+                      [System.IO.File]::WriteAllText($buildCmd, $bc, $utf8NoBom)
+                      Write-Host '  removed "yarn test" from ext\ui-build\build.cmd for this CI run'
+                  }
 
                   if (Test-Path -LiteralPath $uiSrc -PathType Leaf) {
                       Write-Host 'ext\cfx-ui\package.json found: using the repository build.cmd (build UI from source).'

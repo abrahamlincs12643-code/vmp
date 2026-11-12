@@ -5,6 +5,11 @@ on:
     branches:
       - '**'
   workflow_dispatch:
+    inputs:
+      premake_only:
+        description: 'Stop after premake project generation succeeds (fast check, skips MSBuild/UI/artifacts)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,6 +35,7 @@ jobs:
       CFX_RETAIL_BUILD: 'false'
       CFX_FEATURE_BRANCH_BUILD: 'false'
       MSYS2_ROOT: 'C:\msys64'
+      GMP_PREMAKE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.premake_only == true) && 'true' || 'false' }}
 
     steps:
       # MSYS2 recommends disabling automatic CRLF conversion before checkout.
@@ -336,9 +342,167 @@ jobs:
                   Invoke-RunPrebuild -Context $context
               }.GetNewClosure()
 
-              Invoke-LogSection 'Premake project generation' {
-                  Invoke-RunPremake -Context $context -Tools $tools
+              Invoke-LogSection 'Private component diagnostics' {
+                  $root = $context.ProjectRoot
+                  Write-Host 'Component folders matching ros / stronghold / adhesive:'
+                  $found = @(Get-ChildItem -LiteralPath (Join-Path $root 'code\components') -Directory -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match 'ros|stronghold|adhesive' })
+                  if ($found.Count -eq 0) { Write-Host '  (none present in this checkout)' }
+                  foreach ($d in $found) { Write-Host "  $($d.FullName)" }
+
+                  $netLua = Join-Path $root 'code\components\net\component.lua'
+                  if (Test-Path -LiteralPath $netLua -PathType Leaf) {
+                      Write-Host '--- code/components/net/component.lua (first 40 lines) ---'
+                      Get-Content -LiteralPath $netLua -TotalCount 40 | ForEach-Object { Write-Host $_ }
+                  }
+
+                  $componentsLua = Join-Path $root 'code\tools\build\components.lua'
+                  if (Test-Path -LiteralPath $componentsLua -PathType Leaf) {
+                      Write-Host '--- code/tools/build/components.lua (lines 120-175) ---'
+                      $lineNo = 0
+                      Get-Content -LiteralPath $componentsLua | ForEach-Object {
+                          $lineNo++
+                          if ($lineNo -ge 120 -and $lineNo -le 175) { Write-Host ('{0,4}: {1}' -f $lineNo, $_) }
+                      }
+                  }
               }.GetNewClosure()
+
+              Invoke-LogSection 'Premake project generation' {
+                  $root = $context.ProjectRoot
+                  $codeDir = Join-Path $root 'code'
+                  $utf8 = [System.Text.UTF8Encoding]::new($false)
+
+                  # Names (and "provides" aliases) of every component that really exists in this checkout.
+                  $available = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                  $jsonFiles = @(Get-ChildItem -LiteralPath $codeDir -Recurse -Filter 'component.json' -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -notmatch '\\node_modules\\' })
+                  foreach ($file in $jsonFiles) {
+                      try { $j = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json } catch { continue }
+                      if ($null -eq $j) { continue }
+                      if ($j.PSObject.Properties['name'] -and $j.name) { [void]$available.Add([string]$j.name) }
+                      if ($j.PSObject.Properties['provides']) {
+                          foreach ($p in @($j.provides)) { if ($p) { [void]$available.Add([string]$p) } }
+                      }
+                  }
+                  Write-Host "Components registered in this checkout: $($available.Count)"
+
+                  # Removes dependencies on components that do not exist in this checkout
+                  # (private upstream components) from the lua build files and component.json files.
+                  $removeDependencies = {
+                      param([string[]]$Names)
+                      $touched = 0
+
+                      $luaFiles = @(Get-ChildItem -LiteralPath $codeDir -Recurse -Filter '*.lua' -File -ErrorAction SilentlyContinue |
+                          Where-Object { $_.FullName -notmatch '\\(node_modules|tools)\\' })
+                      foreach ($file in $luaFiles) {
+                          $text = [System.IO.File]::ReadAllText($file.FullName)
+                          if ($text -notmatch 'add_dependencies') { continue }
+                          $new = $text
+
+                          foreach ($n in $Names) {
+                              $q = [regex]::Escape($n)
+                              # add_dependencies 'name'   /   add_dependencies('name')
+                              $new = [regex]::Replace($new, 'add_dependencies\s+([''"])' + $q + '\1', 'add_dependencies {}')
+                              $new = [regex]::Replace($new, 'add_dependencies\s*\(\s*([''"])' + $q + '\1\s*\)', 'add_dependencies({})')
+                          }
+
+                          # add_dependencies { 'a', 'name', 'b' }   /   add_dependencies({ ... })
+                          $blocks = [regex]::Matches($new, '(?s)add_dependencies\s*\(?\s*\{[^}]*\}')
+                          for ($i = $blocks.Count - 1; $i -ge 0; $i--) {
+                              $b = $blocks[$i]
+                              $blk = $b.Value
+                              $orig = $blk
+                              foreach ($n in $Names) {
+                                  $q = [regex]::Escape($n)
+                                  $blk = [regex]::Replace($blk, '\s*([''"])' + $q + '\1\s*,?', '')
+                              }
+                              if ($blk -ne $orig) {
+                                  $new = $new.Substring(0, $b.Index) + $blk + $new.Substring($b.Index + $b.Length)
+                              }
+                          }
+
+                          if ($new -ne $text) {
+                              [System.IO.File]::WriteAllText($file.FullName, $new, $utf8)
+                              Write-Host "  patched (lua):  $($file.FullName.Substring($root.Length + 1))"
+                              $touched++
+                          }
+                      }
+
+                      foreach ($file in $jsonFiles) {
+                          try { $j = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json } catch { continue }
+                          if ($null -eq $j -or -not $j.PSObject.Properties['dependencies']) { continue }
+                          $deps = @($j.dependencies)
+                          $kept = @($deps | Where-Object {
+                              $d = ([string]$_) -replace '\[.*$', ''
+                              $Names -notcontains $d
+                          })
+                          if ($kept.Count -ne $deps.Count) {
+                              $j.dependencies = $kept
+                              [System.IO.File]::WriteAllText($file.FullName, ($j | ConvertTo-Json -Depth 32), $utf8)
+                              Write-Host "  patched (json): $($file.FullName.Substring($root.Length + 1))"
+                              $touched++
+                          }
+                      }
+                      return $touched
+                  }
+
+                  # Private upstream components that are not part of the public source tree.
+                  $known = @('ros-patches', 'ros-patches:five', 'stronghold')
+                  $pre = @($known | Where-Object { -not $available.Contains($_) })
+                  $handled = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                  if ($pre.Count -gt 0) {
+                      Write-Host "Unavailable private components, removing dependencies on: $($pre -join ', ')"
+                      [void](& $removeDependencies -Names $pre)
+                      foreach ($n in $pre) { [void]$handled.Add($n) }
+                  }
+
+                  # Run premake; if it still reports unresolved dependencies, remove exactly those and retry.
+                  $maxAttempts = 8
+                  $succeeded = $false
+                  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                      Write-Host "Premake attempt $attempt of $maxAttempts"
+                      $lines = [System.Collections.Generic.List[string]]::new()
+                      $failed = $false
+                      try {
+                          Invoke-RunPremake -Context $context -Tools $tools *>&1 | ForEach-Object {
+                              $s = [string]$_
+                              $lines.Add($s)
+                              Write-Host $s
+                          }
+                      }
+                      catch {
+                          $failed = $true
+                          Write-Host "Premake attempt $attempt failed: $_"
+                      }
+                      if (-not $failed) { $succeeded = $true; break }
+
+                      $unresolved = [System.Collections.Generic.List[string]]::new()
+                      foreach ($line in $lines) {
+                          if ($line -match 'Dependency unresolved for (\S+) in (\S+)') {
+                              if (-not $handled.Contains($Matches[1]) -and -not $unresolved.Contains($Matches[1])) {
+                                  $unresolved.Add($Matches[1])
+                              }
+                          }
+                      }
+                      if ($unresolved.Count -eq 0) {
+                          throw 'Premake failed, and the failure is not caused by an unresolved component dependency. See the premake output above.'
+                      }
+                      Write-Host "Removing dependencies on unresolved components: $($unresolved -join ', ')"
+                      $count = & $removeDependencies -Names $unresolved.ToArray()
+                      foreach ($n in $unresolved) { [void]$handled.Add($n) }
+                      if ($count -eq 0) {
+                          throw "Premake reported unresolved dependencies ($($unresolved -join ', ')) but no build file references them; cannot continue."
+                      }
+                  }
+                  if (-not $succeeded) {
+                      throw "Premake still failing after $maxAttempts attempts."
+                  }
+              }.GetNewClosure()
+
+              if ($env:GMP_PREMAKE_ONLY -eq 'true') {
+                  Write-Host 'GMP_PREMAKE_ONLY=true: premake project generation succeeded; stopping before MSBuild.'
+                  return
+              }
 
               Invoke-LogSection 'Version resource generation' {
                   Invoke-UpdateVersionFiles -Context $context -Versions $versions
@@ -444,6 +608,7 @@ jobs:
           }
 
       - name: Upload GMP.exe
+        if: env.GMP_PREMAKE_ONLY != 'true'
         uses: actions/upload-artifact@v7.0.2
         with:
           name: GMP-exe-${{ github.run_number }}
@@ -455,6 +620,7 @@ jobs:
       # Download this artifact, extract it, then on the server run:
       #   publish.bat "<extracted>\fivereborn"
       - name: Upload GMP client cache (for publish.bat)
+        if: env.GMP_PREMAKE_ONLY != 'true'
         uses: actions/upload-artifact@v7.0.2
         with:
           name: GMP-client-cache-${{ github.run_number }}

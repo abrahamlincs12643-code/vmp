@@ -1,5 +1,5 @@
 
-# <img src="https://cdn.sunrp.ir/other/VMP.png"  width="32"  height="32"> VMP.ir (FiveM/~~RedM~~)
+# <img src="https://cdn.sunrp.ir/other/VMP.png"  width="32"  height="32"> GMP.ir (FiveM/~~RedM~~)
 
 This repository contains the code for the VMP project, a clone of FiveM, with the following main features:
 

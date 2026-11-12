@@ -1,0 +1,729 @@
+name: GMP C++ Windows Build
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      premake_only:
+        description: 'Stop after premake project generation succeeds (fast check, skips MSBuild/UI/artifacts)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gmp-cpp-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-gmp-client:
+    name: Build GMP client (GMP.exe + client cache / Windows x64 / MSVC)
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      CI: 'true'
+      CI_PROJECT_DIR: ${{ github.workspace }}
+      CI_COMMIT_REF_NAME: ${{ github.ref_name }}
+      CI_COMMIT_SHA: ${{ github.sha }}
+      CI_PIPELINE_IID: ${{ github.run_number }}
+      CFX_PRODUCT_NAME: fivem
+      CFX_DRY_RUN: 'true'
+      CFX_RETAIL_BUILD: 'false'
+      CFX_FEATURE_BRANCH_BUILD: 'false'
+      MSYS2_ROOT: 'C:\msys64'
+      GMP_PREMAKE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && inputs.premake_only == true) && 'true' || 'false' }}
+
+    steps:
+      # MSYS2 recommends disabling automatic CRLF conversion before checkout.
+      - name: Configure Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - name: Checkout GMP source
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          lfs: true
+          submodules: false
+          persist-credentials: true
+
+      - name: Set up Python 3.11 for legacy node-gyp
+        id: setup-python
+        uses: actions/setup-python@v7
+        with:
+          # ffi-napi in native-doc-tooling is pinned to node-gyp 9.3.1.
+          # node-gyp < 10 imports distutils, which Python 3.12 removed.
+          python-version: '3.11'
+          check-latest: false
+
+      - name: Validate and pin Python for legacy native addons
+        shell: pwsh
+        env:
+          PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pythonPath = $env:PYTHON_PATH
+          if ([string]::IsNullOrWhiteSpace($pythonPath) -or -not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+            throw "actions/setup-python did not provide a valid Python executable: '$pythonPath'"
+          }
+
+          $pythonVersion = (& $pythonPath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
+          if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne '3.11') {
+            throw "Legacy node-gyp requires Python 3.11; setup-python provided '$pythonVersion'."
+          }
+
+          # Fail early if the exact API imported by node-gyp 9.3.1 is unavailable.
+          & $pythonPath -c "from distutils.version import StrictVersion; print('distutils.version.StrictVersion is available')"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Python 3.11 does not expose distutils.version.StrictVersion; refusing to start Prebuild.'
+          }
+
+          # Force node-gyp (including nested Yarn/npm processes) to use this interpreter.
+          $envLines = @(
+            "PYTHON=$pythonPath",
+            "NODE_GYP_FORCE_PYTHON=$pythonPath",
+            "npm_config_python=$pythonPath"
+          )
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_ENV,
+            ($envLines -join [Environment]::NewLine) + [Environment]::NewLine,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Write-Host "Pinned legacy node-gyp Python: $pythonPath"
+          & $pythonPath --version
+
+      - name: Set up Node.js and Yarn Classic
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Yarn Classic required by CFX build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global yarn@1.22.22
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install Yarn Classic.' }
+          yarn --version
+          if ($LASTEXITCODE -ne 0) { throw 'Yarn is not available after installation.' }
+
+      - name: Validate GMP checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+
+          $requiredFiles = @(
+            '.gitmodules',
+            'prebuild.cmd',
+            'prebuild_natives.cmd',
+            'code\premake5.lua',
+            'code\tools\ci\vswhere.exe',
+            'code\tools\ci\premake5.exe',
+            'code\tools\ci\psm1\cfxBuildContext.psm1',
+            'code\tools\ci\psm1\cfxBuildTools.psm1',
+            'code\tools\ci\psm1\cfxGitlabSections.psm1',
+            'code\tools\ci\psm1\cfxRunMSBuild.psm1',
+            'code\tools\ci\psm1\cfxRunPrebuild.psm1',
+            'code\tools\ci\psm1\cfxRunPremake.psm1',
+            'code\tools\ci\psm1\cfxSetupCEF.psm1',
+            'code\tools\ci\psm1\cfxSetupSubmodules.psm1',
+            'code\tools\ci\psm1\cfxSetupVS.psm1',
+            'code\tools\ci\psm1\cfxUpdateVersionFiles.psm1',
+            'code\tools\ci\psm1\cfxVersions.psm1',
+            'vendor\cef\cef_build_name.txt'
+          )
+
+          $missing = @()
+          foreach ($relativePath in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath (Join-Path $root $relativePath) -PathType Leaf)) {
+              $missing += $relativePath
+            }
+          }
+          if ($missing.Count -gt 0) {
+            throw "This is not a complete GMP source checkout. Missing required build files: $($missing -join ', '). Use the real GMP Git repository root, not a patch ZIP."
+          }
+
+          $gitRootOutput = & git -C $root rev-parse --show-toplevel
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($gitRootOutput -join ''))) {
+            throw 'Git metadata is unavailable. The C++ build must run from a Git checkout, not an extracted source ZIP.'
+          }
+          $gitRoot = [System.IO.Path]::GetFullPath(($gitRootOutput | Select-Object -First 1).Trim()).TrimEnd('\')
+          if (-not [string]::Equals($gitRoot, $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The GMP source must be at the Git repository root so its pinned submodules can be resolved.'
+          }
+
+          $submodulePaths = & git -C $root config -f .gitmodules --get-regexp '^submodule\..*\.path$'
+          if ($LASTEXITCODE -ne 0 -or -not $submodulePaths) {
+            throw 'The root .gitmodules file does not contain valid submodule entries.'
+          }
+
+          # All submodules are public GitHub repositories - no credentials needed.
+          & git config --global http.version HTTP/1.1
+          & git config --global http.lowSpeedLimit 1000
+          & git config --global http.lowSpeedTime 60
+
+          $vswhere = Join-Path $root 'code\tools\ci\vswhere.exe'
+          $vsPath = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if ([string]::IsNullOrWhiteSpace($vsPath)) {
+            throw 'Visual Studio 2022 C++ x64 build tools were not found on the Windows runner.'
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'))) {
+            throw 'Visual Studio was found, but its x64 compiler environment (vcvars64.bat) is missing.'
+          }
+
+          foreach ($command in @('git', 'python', 'py', 'node', 'npm')) {
+            if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+              throw "Required command '$command' is not available in PATH."
+            }
+          }
+
+          $msysPacman = Join-Path $env:MSYS2_ROOT 'usr\bin\pacman.exe'
+          $msysShell = Join-Path $env:MSYS2_ROOT 'usr\bin\sh.exe'
+          if (-not (Test-Path -LiteralPath $msysPacman -PathType Leaf)) {
+            throw "MSYS2 pacman was not found at the required runner path: $msysPacman"
+          }
+          if (-not (Test-Path -LiteralPath $msysShell -PathType Leaf)) {
+            throw "MSYS2 shell was not found at the required runner path: $msysShell"
+          }
+
+          Write-Host "GMP source root: $root"
+          Write-Host "Visual Studio: $vsPath"
+          Write-Host "Submodule entries: $($submodulePaths.Count)"
+          Write-Host 'Preflight completed.'
+
+      - name: Install required Windows SDK 10.0.22000.0
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkVersion = '10.0.22000.0'
+          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $includeRoot = Join-Path $kitsRoot "Include\$sdkVersion"
+          $libRoot = Join-Path $kitsRoot "Lib\$sdkVersion"
+          $requiredSdkFiles = @(
+            (Join-Path $includeRoot 'um\Windows.h'),
+            (Join-Path $includeRoot 'shared\winapifamily.h'),
+            (Join-Path $libRoot 'um\x64\kernel32.lib'),
+            (Join-Path $kitsRoot "bin\$sdkVersion\x64\rc.exe")
+          )
+
+          $missingFiles = @($requiredSdkFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+          if ($missingFiles.Count -gt 0) {
+            Write-Host "Windows SDK $sdkVersion is missing. Installing the Microsoft SDK package..."
+
+            $installerPath = Join-Path $env:RUNNER_TEMP 'winsdk-10.0.22000-setup.exe'
+            $downloadUrl = 'https://go.microsoft.com/fwlink/?linkid=2173743'
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -MaximumRedirection 10 -TimeoutSec 1800
+
+            if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+              throw 'Microsoft Windows SDK installer download failed: installer file was not created.'
+            }
+            if ((Get-Item -LiteralPath $installerPath).Length -lt 100KB) {
+              throw 'Microsoft Windows SDK installer download is unexpectedly small; refusing to execute it.'
+            }
+
+            $signature = Get-AuthenticodeSignature -FilePath $installerPath
+            if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch 'Microsoft') {
+              throw "Windows SDK installer signature validation failed. Status: $($signature.Status); signer: $($signature.SignerCertificate.Subject)"
+            }
+            Write-Host "Verified Microsoft-signed SDK installer: $($signature.SignerCertificate.Subject)"
+
+            # This Microsoft archive installer provides SDK 10.0.22000.194, serviced
+            # to 10.0.22000.832, while registering the SDK target version as 10.0.22000.0.
+            # Select the desktop C++ x64 components needed by the generated .vcxproj files.
+            $installerArguments = '/q /norestart /ceip off /features OptionId.UWPManaged OptionId.UWPCPP OptionId.UWPLocalized OptionId.DesktopCPPx86 OptionId.DesktopCPPx64 OptionId.DesktopCPParm64'
+            $installProcess = Start-Process -FilePath $installerPath -ArgumentList $installerArguments -Wait -PassThru
+            if ($installProcess.ExitCode -notin @(0, 3010)) {
+              throw "Windows SDK $sdkVersion installer failed with exit code $($installProcess.ExitCode)."
+            }
+            if ($installProcess.ExitCode -eq 3010) {
+              Write-Warning 'Windows SDK installer requested a reboot (3010); verifying required SDK files before continuing.'
+            }
+          }
+
+          $missingFiles = @($requiredSdkFiles | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
+          if ($missingFiles.Count -gt 0) {
+            throw "Windows SDK $sdkVersion installation is incomplete. Missing required files: $($missingFiles -join '; ')"
+          }
+
+          $kitsRegistry = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue
+          if (-not $kitsRegistry -or [string]::IsNullOrWhiteSpace($kitsRegistry.KitsRoot10)) {
+            throw 'Windows SDK files exist, but the Windows Kits registry entry (KitsRoot10) is missing.'
+          }
+
+          Write-Host "Windows SDK $sdkVersion is installed and verified."
+          Write-Host "KitsRoot10: $($kitsRegistry.KitsRoot10)"
+          Write-Host 'Verified SDK files:'
+          $requiredSdkFiles | ForEach-Object { Write-Host "  $_" }
+
+      - name: Build GMP client (C++, UI, client cache)
+        shell: pwsh
+        working-directory: code/tools/ci
+        env:
+          # Apply the pin directly to the process that launches CFX Prebuild.
+          PYTHON: ${{ steps.setup-python.outputs.python-path }}
+          NODE_GYP_FORCE_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+          npm_config_python: ${{ steps.setup-python.outputs.python-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # GitHub's pwsh runner prepends its own PowerShell statement to `run:` scripts.
+          # PowerShell therefore rejects `using module` placed directly in this YAML step.
+          # Write the module-based build script to a standalone .ps1 file so its using
+          # declarations are parsed at the top level, before any executable statement.
+          $buildScript = @'
+          using module .\psm1\cfxBuildContext.psm1
+          using module .\psm1\cfxBuildTools.psm1
+          using module .\psm1\cfxBuildUI.psm1
+          using module .\psm1\cfxGitlabSections.psm1
+          using module .\psm1\cfxPackClient.psm1
+          using module .\psm1\cfxRunMSBuild.psm1
+          using module .\psm1\cfxRunPrebuild.psm1
+          using module .\psm1\cfxRunPremake.psm1
+          using module .\psm1\cfxSetupCEF.psm1
+          using module .\psm1\cfxSetupSubmodules.psm1
+          using module .\psm1\cfxSetupVS.psm1
+          using module .\psm1\cfxUpdateVersionFiles.psm1
+          using module .\psm1\cfxVersions.psm1
+
+          $ErrorActionPreference = 'Stop'
+
+          try {
+              Set-Location $env:CI_PROJECT_DIR
+
+              $context = Get-CfxBuildContext -RequireProductName
+              $tools = Get-CfxBuildTools -Context $context
+              $versions = Get-CfxVersions -Context $context
+
+              $tools.ensurePython()
+              $tools.ensureNodeJS()
+              $tools.ensureYarn()
+
+              Write-Host "Project root: $($context.ProjectRoot)"
+              Write-Host "Product: $($context.ProductName)"
+              Write-Host "Target executable: $($context.ProductExeName)"
+              Write-Host "MSBuild solution: $($context.MSBuildSolution)"
+
+              $context.startBuild()
+
+              Invoke-LogSection 'Visual Studio environment setup' {
+                  Invoke-CfxSetupVS -Context $context -Tools $tools
+              }.GetNewClosure()
+
+              Invoke-LogSection 'GMP Git submodules setup' {
+                  Invoke-SetupSubmodules -Root $context.ProjectRoot
+              }.GetNewClosure()
+
+              & git -C $context.ProjectRoot submodule update --init --recursive --jobs=8 --force
+              if ($LASTEXITCODE -ne 0) {
+                  throw 'Git failed while recursively checking out the pinned GMP submodules.'
+              }
+
+              $submoduleStatus = & git -C $context.ProjectRoot submodule status --recursive
+              if ($LASTEXITCODE -ne 0) {
+                  throw 'Git could not verify the GMP submodule checkout.'
+              }
+              $badSubmodules = @($submoduleStatus | Where-Object { $_ -match '^[\-+U]' })
+              if ($badSubmodules.Count -gt 0) {
+                  throw "Some GMP submodules are missing or not at their pinned commits:`n$($badSubmodules -join "`n")"
+              }
+
+              Invoke-LogSection 'CEF dependency setup' {
+                  Invoke-CfxSetupCEF -Context $context -Tools $tools
+              }.GetNewClosure()
+
+              Invoke-LogSection 'GMP prebuild' {
+                  Invoke-RunPrebuild -Context $context
+              }.GetNewClosure()
+
+              Invoke-LogSection 'Private component diagnostics' {
+                  $root = $context.ProjectRoot
+                  Write-Host 'Component folders matching ros / stronghold / adhesive:'
+                  $found = @(Get-ChildItem -LiteralPath (Join-Path $root 'code\components') -Directory -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match 'ros|stronghold|adhesive' })
+                  if ($found.Count -eq 0) { Write-Host '  (none present in this checkout)' }
+                  foreach ($d in $found) { Write-Host "  $($d.FullName)" }
+
+                  $netLua = Join-Path $root 'code\components\net\component.lua'
+                  if (Test-Path -LiteralPath $netLua -PathType Leaf) {
+                      Write-Host '--- code/components/net/component.lua (first 40 lines) ---'
+                      Get-Content -LiteralPath $netLua -TotalCount 40 | ForEach-Object { Write-Host $_ }
+                  }
+
+                  $componentsLua = Join-Path $root 'code\tools\build\components.lua'
+                  if (Test-Path -LiteralPath $componentsLua -PathType Leaf) {
+                      Write-Host '--- code/tools/build/components.lua (lines 120-175) ---'
+                      $lineNo = 0
+                      Get-Content -LiteralPath $componentsLua | ForEach-Object {
+                          $lineNo++
+                          if ($lineNo -ge 120 -and $lineNo -le 175) { Write-Host ('{0,4}: {1}' -f $lineNo, $_) }
+                      }
+                  }
+              }.GetNewClosure()
+
+              # ---------------------------------------------------------------------
+              # Private upstream APIs that are NOT part of this public checkout:
+              #   LegitimacyAPI.h  (ros-patches component, disabled in components/config.lua,
+              #                     and its dependency gets stripped by the premake retry below)
+              #   FoxApi.h         (private anti-cheat state API used by glue + font-renderer)
+              # MSBuild failed with C1083 "Cannot open include file" for both of them.
+              # We generate self-contained inline stubs (so there is nothing to link against)
+              # and redirect the includes to them. NOTE: this is a hashtable-free, array-based
+              # writer on purpose: a nested here-string would terminate the outer one.
+              # ---------------------------------------------------------------------
+              Invoke-LogSection 'GMP private API stubs (LegitimacyAPI / FoxApi)' {
+                  $root = $context.ProjectRoot
+                  $shared = Join-Path $root 'code\client\shared'
+                  $components = Join-Path $root 'code\components'
+                  if (-not (Test-Path -LiteralPath $shared -PathType Container)) { throw "Missing include directory: $shared" }
+                  if (-not (Test-Path -LiteralPath $components -PathType Container)) { throw "Missing components directory: $components" }
+
+                  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+                  $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+
+                  $stubLegit = @(
+                      '#pragma once',
+                      '// GMP CI stub for the private ros-patches LegitimacyAPI.h (not in the public tree).',
+                      '#include <string>',
+                      '',
+                      'namespace ros',
+                      '{',
+                      '    inline std::string GetEntitlementSource() { return std::string(); }',
+                      '    inline std::string GetApiIdentifier() { return std::string(); }',
+                      '}'
+                  )
+                  $stubFox = @(
+                      '#pragma once',
+                      '// GMP CI stub for the private FoxApi.h (not in the public tree).',
+                      'inline bool getXState() { return false; }',
+                      'inline bool getFaceItState() { return false; }'
+                  )
+                  [System.IO.File]::WriteAllText((Join-Path $shared 'GmpLegitimacyStub.h'), (($stubLegit -join "`n") + "`n"), $utf8NoBom)
+                  [System.IO.File]::WriteAllText((Join-Path $shared 'FoxApi.h'), (($stubFox -join "`n") + "`n"), $utf8NoBom)
+                  Write-Host "  wrote stub: code\client\shared\GmpLegitimacyStub.h"
+                  Write-Host "  wrote stub: code\client\shared\FoxApi.h"
+
+                  # Redirect <LegitimacyAPI.h> (net, discord, glue, fxdk-main, ...) to the stub.
+                  # ros-patches-* are skipped: they provide the real implementation and are not built here.
+                  $patched = 0
+                  $sources = @(Get-ChildItem -LiteralPath $components -Recurse -File -ErrorAction SilentlyContinue |
+                      Where-Object {
+                          $_.Extension -in @('.cpp', '.cc', '.h', '.hpp', '.inl') -and
+                          $_.FullName -notmatch '\\(node_modules|ros-patches-[A-Za-z0-9]+)\\'
+                      })
+                  foreach ($file in $sources) {
+                      $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+                      $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+                      $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                      if ($hasBom) { $text = $text.Substring(1) }
+                      if ($text -notmatch '#\s*include\s*<LegitimacyAPI\.h>') { continue }
+                      $new = [regex]::Replace($text, '#\s*include\s*<LegitimacyAPI\.h>', '#include <GmpLegitimacyStub.h>')
+                      $enc = if ($hasBom) { $utf8Bom } else { $utf8NoBom }
+                      [System.IO.File]::WriteAllText($file.FullName, $new, $enc)
+                      Write-Host "  redirected LegitimacyAPI.h: $($file.FullName.Substring($root.Length + 1))"
+                      $patched++
+                  }
+                  Write-Host "Files redirected to the LegitimacyAPI stub: $patched"
+                  if ($patched -eq 0) {
+                      Write-Host 'No LegitimacyAPI.h includes found (already patched or not used).'
+                  }
+              }.GetNewClosure()
+
+              Invoke-LogSection 'Premake project generation' {
+                  $root = $context.ProjectRoot
+                  $codeDir = Join-Path $root 'code'
+                  $utf8 = [System.Text.UTF8Encoding]::new($false)
+
+                  # Names (and "provides" aliases) of every component that really exists in this checkout.
+                  $available = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                  $jsonFiles = @(Get-ChildItem -LiteralPath $codeDir -Recurse -Filter 'component.json' -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -notmatch '\\node_modules\\' })
+                  foreach ($file in $jsonFiles) {
+                      try { $j = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json } catch { continue }
+                      if ($null -eq $j) { continue }
+                      if ($j.PSObject.Properties['name'] -and $j.name) { [void]$available.Add([string]$j.name) }
+                      if ($j.PSObject.Properties['provides']) {
+                          foreach ($p in @($j.provides)) { if ($p) { [void]$available.Add([string]$p) } }
+                      }
+                  }
+                  Write-Host "Components registered in this checkout: $($available.Count)"
+
+                  # Removes dependencies on components that do not exist in this checkout
+                  # (private upstream components) from the lua build files and component.json files.
+                  $removeDependencies = {
+                      param([string[]]$Names)
+                      $touched = 0
+
+                      $luaFiles = @(Get-ChildItem -LiteralPath $codeDir -Recurse -Filter '*.lua' -File -ErrorAction SilentlyContinue |
+                          Where-Object { $_.FullName -notmatch '\\(node_modules|tools)\\' })
+                      foreach ($file in $luaFiles) {
+                          $text = [System.IO.File]::ReadAllText($file.FullName)
+                          if ($text -notmatch 'add_dependencies') { continue }
+                          $new = $text
+
+                          foreach ($n in $Names) {
+                              $q = [regex]::Escape($n)
+                              # add_dependencies 'name'   /   add_dependencies('name')
+                              $new = [regex]::Replace($new, 'add_dependencies\s+([''"])' + $q + '\1', 'add_dependencies {}')
+                              $new = [regex]::Replace($new, 'add_dependencies\s*\(\s*([''"])' + $q + '\1\s*\)', 'add_dependencies({})')
+                          }
+
+                          # add_dependencies { 'a', 'name', 'b' }   /   add_dependencies({ ... })
+                          $blocks = [regex]::Matches($new, '(?s)add_dependencies\s*\(?\s*\{[^}]*\}')
+                          for ($i = $blocks.Count - 1; $i -ge 0; $i--) {
+                              $b = $blocks[$i]
+                              $blk = $b.Value
+                              $orig = $blk
+                              foreach ($n in $Names) {
+                                  $q = [regex]::Escape($n)
+                                  $blk = [regex]::Replace($blk, '\s*([''"])' + $q + '\1\s*,?', '')
+                              }
+                              if ($blk -ne $orig) {
+                                  $new = $new.Substring(0, $b.Index) + $blk + $new.Substring($b.Index + $b.Length)
+                              }
+                          }
+
+                          if ($new -ne $text) {
+                              [System.IO.File]::WriteAllText($file.FullName, $new, $utf8)
+                              Write-Host "  patched (lua):  $($file.FullName.Substring($root.Length + 1))"
+                              $touched++
+                          }
+                      }
+
+                      foreach ($file in $jsonFiles) {
+                          try { $j = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json } catch { continue }
+                          if ($null -eq $j -or -not $j.PSObject.Properties['dependencies']) { continue }
+                          $deps = @($j.dependencies)
+                          $kept = @($deps | Where-Object {
+                              $d = ([string]$_) -replace '\[.*$', ''
+                              $Names -notcontains $d
+                          })
+                          if ($kept.Count -ne $deps.Count) {
+                              $j.dependencies = $kept
+                              [System.IO.File]::WriteAllText($file.FullName, ($j | ConvertTo-Json -Depth 32), $utf8)
+                              Write-Host "  patched (json): $($file.FullName.Substring($root.Length + 1))"
+                              $touched++
+                          }
+                      }
+                      return $touched
+                  }
+
+                  # Private upstream components that are not part of the public source tree.
+                  $known = @('ros-patches', 'ros-patches:five', 'stronghold')
+                  $pre = @($known | Where-Object { -not $available.Contains($_) })
+                  $handled = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                  if ($pre.Count -gt 0) {
+                      Write-Host "Unavailable private components, removing dependencies on: $($pre -join ', ')"
+                      [void](& $removeDependencies -Names $pre)
+                      foreach ($n in $pre) { [void]$handled.Add($n) }
+                  }
+
+                  # Run premake; if it still reports unresolved dependencies, remove exactly those and retry.
+                  $maxAttempts = 8
+                  $succeeded = $false
+                  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                      Write-Host "Premake attempt $attempt of $maxAttempts"
+                      $lines = [System.Collections.Generic.List[string]]::new()
+                      $failed = $false
+                      try {
+                          Invoke-RunPremake -Context $context -Tools $tools *>&1 | ForEach-Object {
+                              $s = [string]$_
+                              $lines.Add($s)
+                              Write-Host $s
+                          }
+                      }
+                      catch {
+                          $failed = $true
+                          Write-Host "Premake attempt $attempt failed: $_"
+                      }
+                      if (-not $failed) { $succeeded = $true; break }
+
+                      $unresolved = [System.Collections.Generic.List[string]]::new()
+                      foreach ($line in $lines) {
+                          if ($line -match 'Dependency unresolved for (\S+) in (\S+)') {
+                              if (-not $handled.Contains($Matches[1]) -and -not $unresolved.Contains($Matches[1])) {
+                                  $unresolved.Add($Matches[1])
+                              }
+                          }
+                      }
+                      if ($unresolved.Count -eq 0) {
+                          throw 'Premake failed, and the failure is not caused by an unresolved component dependency. See the premake output above.'
+                      }
+                      Write-Host "Removing dependencies on unresolved components: $($unresolved -join ', ')"
+                      $count = & $removeDependencies -Names $unresolved.ToArray()
+                      foreach ($n in $unresolved) { [void]$handled.Add($n) }
+                      if ($count -eq 0) {
+                          throw "Premake reported unresolved dependencies ($($unresolved -join ', ')) but no build file references them; cannot continue."
+                      }
+                  }
+                  if (-not $succeeded) {
+                      throw "Premake still failing after $maxAttempts attempts."
+                  }
+              }.GetNewClosure()
+
+              if ($env:GMP_PREMAKE_ONLY -eq 'true') {
+                  Write-Host 'GMP_PREMAKE_ONLY=true: premake project generation succeeded; stopping before MSBuild.'
+                  return
+              }
+
+              Invoke-LogSection 'Version resource generation' {
+                  Invoke-UpdateVersionFiles -Context $context -Versions $versions
+              }.GetNewClosure()
+
+              Invoke-LogSection 'MSBuild Release x64' {
+                  Invoke-RunMSBuild -Context $context -Tools $tools
+              }.GetNewClosure()
+
+              $exePath = Join-Path $context.MSBuildOutput $context.ProductExeName
+              if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+                  Write-Host "Expected executable not found: $exePath - searching build output for the launcher exe..."
+                  $outDir = $context.MSBuildOutput
+                  $binRoot = Join-Path $context.ProjectRoot '.build-cache\bin'
+                  foreach ($dir in @($outDir, $binRoot)) {
+                      if (Test-Path -LiteralPath $dir) {
+                          Write-Host "Executables under ${dir}:"
+                          Get-ChildItem -LiteralPath $dir -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue |
+                              ForEach-Object { Write-Host ("  {0}  ({1} bytes)" -f $_.FullName, $_.Length) }
+                      }
+                  }
+                  $found = $null
+                  foreach ($name in @('GMP.exe', 'VMP.exe', 'FiveM.exe', 'CitizenFX.exe', 'Launcher.exe')) {
+                      $cand = Get-ChildItem -LiteralPath $binRoot -Filter $name -File -Recurse -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Length -gt 100KB } | Select-Object -First 1
+                      if ($cand) { $found = $cand.FullName; break }
+                  }
+                  if (-not $found) {
+                      $any = Get-ChildItem -LiteralPath $binRoot -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Length -gt 1MB } | Sort-Object Length -Descending | Select-Object -First 1
+                      if ($any) { $found = $any.FullName }
+                  }
+                  if (-not $found) {
+                      throw "MSBuild did not produce any launcher executable under $binRoot (see the executable listing above; look for earlier 'error C' / 'error LNK' lines in the MSBuild log)."
+                  }
+                  Write-Host "Using launcher executable: $found"
+                  # The pack step may look for the product exe name; make it available there too.
+                  $expected = Join-Path $context.MSBuildOutput $context.ProductExeName
+                  if (-not [string]::Equals($found, $expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+                      Copy-Item -LiteralPath $found -Destination $expected -Force
+                      Write-Host "Copied $found -> $expected"
+                  }
+                  $exePath = $expected
+              }
+
+              $fileInfo = Get-Item -LiteralPath $exePath
+              if ($fileInfo.Length -le 0) {
+                  throw "The generated executable is empty: $exePath"
+              }
+
+              # Validate the PE signature and AMD64 machine type before uploading.
+              $stream = [System.IO.File]::OpenRead($exePath)
+              try {
+                  $dosHeader = [byte[]]::new(64)
+                  if ($stream.Read($dosHeader, 0, $dosHeader.Length) -ne $dosHeader.Length) {
+                      throw 'The generated executable has an incomplete DOS header.'
+                  }
+                  if ([Text.Encoding]::ASCII.GetString($dosHeader, 0, 2) -ne 'MZ') {
+                      throw 'The generated file does not have a valid Windows MZ header.'
+                  }
+
+                  $peOffset = [BitConverter]::ToInt32($dosHeader, 0x3C)
+                  if ($peOffset -lt 64 -or $peOffset -gt ($stream.Length - 6)) {
+                      throw 'The generated executable has an invalid PE header offset.'
+                  }
+
+                  $stream.Position = $peOffset
+                  $peHeader = [byte[]]::new(6)
+                  if ($stream.Read($peHeader, 0, $peHeader.Length) -ne $peHeader.Length) {
+                      throw 'The generated executable has an incomplete PE header.'
+                  }
+                  if ([Text.Encoding]::ASCII.GetString($peHeader, 0, 4) -ne "PE`0`0") {
+                      throw 'The generated file does not have a valid PE signature.'
+                  }
+
+                  $machine = [BitConverter]::ToUInt16($peHeader, 4)
+                  if ($machine -ne 0x8664) {
+                      throw ('The generated executable is not Windows x64. PE machine type: 0x{0:X4}' -f $machine)
+                  }
+              }
+              finally {
+                  $stream.Dispose()
+              }
+
+              Write-Host "Client executable built: $exePath"
+
+              # Web UI (prebuilt UI bundle + loading screen -> ext\ui-build\data.zip / data_big.zip)
+              Invoke-LogSection 'Building UI' {
+                  Invoke-BuildUI -Context $context -Versions $versions
+              }.GetNewClosure()
+
+              # Pack the client cache: <repo>\caches\fivereborn  (this is the folder you give to publish.bat)
+              Invoke-LogSection 'Packing client cache' {
+                  Invoke-PackClient -Context $context -Tools $tools -Versions $versions
+              }.GetNewClosure()
+
+              $packedCache = Join-Path $context.CachesRoot 'fivereborn'
+              if (-not (Test-Path -LiteralPath (Join-Path $packedCache 'citizen\ui.zip') -PathType Leaf)) {
+                  throw "Packed client cache is incomplete (citizen\ui.zip missing): $packedCache"
+              }
+
+              # GMP.exe = the launcher/bootstrapper binary under the GMP name
+              $dist = Join-Path $context.ProjectRoot 'gmp-dist'
+              New-Item -ItemType Directory -Force -Path $dist | Out-Null
+              Copy-Item -LiteralPath $exePath -Destination (Join-Path $dist 'GMP.exe') -Force
+              Write-Host "GMP.exe: $((Get-Item (Join-Path $dist 'GMP.exe')).Length) bytes"
+
+              $context.finishBuild()
+              Write-Host "GMP client successfully built."
+          }
+          catch {
+              Write-Host $_
+              Write-Host 'GMP BUILD FAILED'
+              throw
+          }
+          '@
+
+          # Keep the generated script beside the psm1 folder so relative `using module`
+          # paths resolve exactly as they do in the repository's own CI scripts.
+          $temporaryBuildScript = Join-Path (Get-Location).Path ("gmp-cpp-build-{0}.ps1" -f $env:GITHUB_RUN_ID)
+          [System.IO.File]::WriteAllText(
+              $temporaryBuildScript,
+              $buildScript,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          try {
+              Write-Host "Legacy node-gyp Python: $env:NODE_GYP_FORCE_PYTHON"
+              Write-Host "Executing standalone PowerShell build script: $temporaryBuildScript"
+              & $temporaryBuildScript
+          }
+          finally {
+              Remove-Item -LiteralPath $temporaryBuildScript -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload GMP.exe
+        if: env.GMP_PREMAKE_ONLY != 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: GMP-exe-${{ github.run_number }}
+          path: gmp-dist/GMP.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      # Download this artifact, extract it, then on the server run:
+      #   publish.bat "<extracted>\fivereborn"
+      - name: Upload GMP client cache (for publish.bat)
+        if: env.GMP_PREMAKE_ONLY != 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: GMP-client-cache-${{ github.run_number }}
+          path: caches/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30

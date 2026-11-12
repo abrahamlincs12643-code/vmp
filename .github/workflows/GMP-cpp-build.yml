@@ -582,7 +582,32 @@ jobs:
 
               $exePath = Join-Path $context.MSBuildOutput $context.ProductExeName
               if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-                  throw "MSBuild did not produce the expected executable: $exePath"
+                  Write-Host "Expected executable not found: $exePath - searching build output for the launcher exe..."
+                  $outDir = $context.MSBuildOutput
+                  $binRoot = Join-Path $context.ProjectRoot '.build-cache\bin'
+                  foreach ($dir in @($outDir, $binRoot)) {
+                      if (Test-Path -LiteralPath $dir) {
+                          Write-Host "Executables under ${dir}:"
+                          Get-ChildItem -LiteralPath $dir -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue |
+                              ForEach-Object { Write-Host ("  {0}  ({1} bytes)" -f $_.FullName, $_.Length) }
+                      }
+                  }
+                  $found = $null
+                  foreach ($name in @('GMP.exe', 'VMP.exe', 'FiveM.exe', 'CitizenFX.exe', 'Launcher.exe')) {
+                      $cand = Get-ChildItem -LiteralPath $binRoot -Filter $name -File -Recurse -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Length -gt 100KB } | Select-Object -First 1
+                      if ($cand) { $found = $cand.FullName; break }
+                  }
+                  if (-not $found) {
+                      $any = Get-ChildItem -LiteralPath $binRoot -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Length -gt 1MB } | Sort-Object Length -Descending | Select-Object -First 1
+                      if ($any) { $found = $any.FullName }
+                  }
+                  if (-not $found) {
+                      throw "MSBuild did not produce any launcher executable under $binRoot (see the executable listing above; look for earlier 'error C' / 'error LNK' lines in the MSBuild log)."
+                  }
+                  Write-Host "Using launcher executable: $found"
+                  $exePath = $found
               }
 
               $fileInfo = Get-Item -LiteralPath $exePath

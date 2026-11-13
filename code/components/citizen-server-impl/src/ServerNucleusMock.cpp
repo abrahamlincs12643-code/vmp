@@ -22,31 +22,6 @@
 
 #if VMP_ALLOW_CFX_NUCLEUS
 
-// 100KiB cap, conditional notices should fit more than comfortably under this limit
-#define MAX_NOTICE_FILESIZE 102400
-
-static void DownloadAndProcessNotices(fx::ServerInstanceBase* server, HttpClient* httpClient)
-{
-	HttpRequestOptions options;
-	options.maxFilesize = MAX_NOTICE_FILESIZE;
-	httpClient->DoGetRequest("https://gss.cfx-services.net/v1/public/promotions-targeting", options, [server, httpClient](bool success, const char* data, size_t length)
-	{
-		// Double checking received size because CURL will let bigger files through if the server doesn't specify Content-Length outright
-		if (success && length <= MAX_NOTICE_FILESIZE)
-		{
-			try
-			{
-				auto noticesBlob = nlohmann::json::parse(data, data + length);
-				fx::NoticeLogicProcessor::BeginProcessingNotices(server, noticesBlob);
-			}
-			catch (std::exception& e)
-			{
-				trace("Notice error: %s\n", e.what());
-			}
-		}
-	});
-}
-
 static InitFunction initFunction([]()
 {
 	static auto httpClient = new HttpClient();
@@ -72,17 +47,12 @@ static InitFunction initFunction([]()
 				return;
 			}
 
-			auto licenseTokenVar = instance->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("sv_licenseKeyToken");
+			// the GMP license session is created by ServerAuth.cpp (server/register.php)
+			auto varManager = instance->GetComponent<console::Context>()->GetVariableManager();
+			auto sessionVar = varManager->FindEntryRaw("sv_sessionId");
+			auto secretVar = varManager->FindEntryRaw("sv_secret");
 
-			if (!licenseTokenVar || licenseTokenVar->GetValue().empty())
-			{
-				return;
-			}
-
-			auto licensingComponent = instance->GetComponent<ServerLicensingComponent>();
-			auto nucleusToken = licensingComponent->GetNucleusToken();
-
-			if (nucleusToken.empty())
+			if (!sessionVar || sessionVar->GetValue().empty() || sessionVar->GetValue() == "0" || !secretVar || secretVar->GetValue().empty())
 			{
 				return;
 			}
@@ -90,7 +60,8 @@ static InitFunction initFunction([]()
 			auto tlm = instance->GetComponent<fx::TcpListenManager>();
 
 			auto reqJson = nlohmann::json::object({
-				{ "token", nucleusToken },
+				{ "session_id", sessionVar->GetValue() },
+				{ "secret", secretVar->GetValue() },
 				{ "port", fmt::sprintf("%d", tlm->GetPrimaryPort()) },
 				{ "ipOverride", instance->GetComponent<fx::GameServer>()->GetIpOverrideVar()->GetValue() },
 			});
@@ -151,8 +122,6 @@ static InitFunction initFunction([]()
 				static auto webVar = instance->AddVariable<std::string>("web_baseUrl", ConVar_None, host);
 
 				registerSuccess = true;
-
-				DownloadAndProcessNotices(instance, httpClient);
 			});
 		});
 	}, INT32_MAX);

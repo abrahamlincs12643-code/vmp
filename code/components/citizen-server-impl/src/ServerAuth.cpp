@@ -60,7 +60,23 @@ static InitFunction httpinitFunction([]()
 			return;
 		}
 
-		auto jsonData = nlohmann::json::object({ { "license", var->GetValue() } });
+		auto licenseKey = var->GetValue();
+		boost::trim(licenseKey);
+
+		// GMP license keys always start with "gmp"
+		if (licenseKey.size() < 4 || !boost::iequals(licenseKey.substr(0, 3), "gmp"))
+		{
+			RefuseToStart("Invalid sv_licenseKey: GMP license keys start with \"gmp\".");
+			return;
+		}
+
+#ifdef _WIN32
+		const char* platformName = "windows";
+#else
+		const char* platformName = "linux";
+#endif
+
+		auto jsonData = nlohmann::json::object({ { "license", licenseKey }, { "product", "fxserver" }, { "platform", platformName } });
 		auto tlm = instance->GetComponent<fx::TcpListenManager>();
 
 		HttpRequestOptions opts;
@@ -102,10 +118,29 @@ static InitFunction httpinitFunction([]()
 				consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "set", "sv_secret", response.value("secret", "0") });
 			}
 
+			auto joinCode = response.value("join_code", std::string{});
+			auto joinUrl = response.value("join_url", std::string{});
+
+			if (!joinCode.empty())
+			{
+				se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
+				consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "set", "gmp_joinCode", joinCode });
+			}
+
 			instance->GetComponent<fx::GameServer>()->ForceHeartbeat();
 
 			console::Printf("Server Auth", "Server license key authentication succeeded!\n");
 			console::Printf("Server Auth", "Session Id : %s\n", response.value("session_id", "0"));
+
+			if (!joinCode.empty())
+			{
+				console::Printf("Server Auth", "Join code  : %s\n", joinCode);
+			}
+
+			if (!joinUrl.empty())
+			{
+				console::Printf("Server Auth", "Join URL   : %s\n", joinUrl);
+			}
 
 			licenseChecked = true;
 			done->set_value();

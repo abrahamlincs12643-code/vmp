@@ -2,6 +2,7 @@ using module .\cfxBuildContext.psm1
 using module .\cfxBuildTools.psm1
 using module .\cfxCacheVersions.psm1
 using module .\cfxVersions.psm1
+using module .\doSomething.psm1
 
 function Invoke-PackClient {
     param(
@@ -13,6 +14,32 @@ function Invoke-PackClient {
     $cacheName = "fivereborn"
 
     $binRoot = $Context.MSBuildOutput
+
+
+    # Sign exe and dll files with "VMP" in description that aren't already signed
+    Get-ChildItem -Path $binRoot -Include *.exe, *.dll -Recurse | ForEach-Object {
+        $file = $_
+        $filePath = $file.FullName
+
+        # Get file description
+        $fileInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($filePath)
+        $description = $fileInfo.FileDescription
+
+        # Check if description contains "VMP"
+        if ($description -and $description -like "*VMP*") {
+            # Check if file is already signed
+            $signature = Get-AuthenticodeSignature -FilePath $filePath
+
+            if ($signature.Status -ne 'Valid') {
+                Write-Host "Signing file: $filePath"
+                & signtool sign /sha1 "644a24e302160046fdd8291ddc920ea5802b5659" /tr http://time.certum.pl /td sha256 /fd sha256 /v "$filePath"
+            }
+            else {
+                Write-Host "File already signed: $filePath"
+            }
+        }
+    }
+
     $packRoot = [IO.Path]::Combine($Context.CachesRoot, $cacheName)
     $cachesRoot = $Context.CachesRoot
     $projectRoot = $Context.ProjectRoot
@@ -51,11 +78,11 @@ function Invoke-PackClient {
         Copy-Item -Force -Recurse $projectRoot\data\client_rdr\*             $packRoot\
     }
 
-    # GMP FIX (FiveM crash "msvcp140.dll+12A47" right after update):
-    # data\redist\crt in the repo holds an OLD copy of msvcp140/vcruntime140. The binaries are compiled with the
-    # (newer) MSVC toolset of the CI runner, and the app loads the CRT from FiveM.app\bin first, so an older
-    # msvcp140.dll than the compiler's STL crashes at startup. Always bundle the CRT that ships with the toolset
-    # that built this client (Visual Studio\VC\Redist\MSVC\<newest>\x64\Microsoft.VC14x.CRT).
+    # GMP FIX (crash "msvcp140.dll+12A47" right after update):
+    # data\redist\crt in the repo holds an OLD copy of msvcp140/vcruntime140. The client is compiled with the newer
+    # MSVC toolset of the CI runner, and the app loads the CRT from bin\ first, so an msvcp140.dll older than the
+    # compiler's STL crashes. Bundle the CRT that ships with the toolset that built this client
+    # (Visual Studio\VC\Redist\MSVC\<newest>\x64\Microsoft.VC14x.CRT). Never downgrade an already newer copy.
     $vswhere = [IO.Path]::Combine($projectRoot, "code\tools\ci\vswhere.exe")
     $vsPath = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($vsPath)) {
@@ -73,17 +100,22 @@ function Invoke-PackClient {
         throw "GMP: MSVC x64 CRT redistributable not found under $redistRoot"
     }
 
+    $packedMsvcp = "$packRoot\bin\msvcp140.dll"
+    $toolMsvcp = Join-Path $crtDir.FullName "msvcp140.dll"
     $oldVer = $null
-    if (Test-Path -LiteralPath "$packRoot\bin\msvcp140.dll") {
-        $oldVer = (Get-Item "$packRoot\bin\msvcp140.dll").VersionInfo.FileVersion
+    if (Test-Path -LiteralPath $packedMsvcp) {
+        $oldVer = (Get-Item -LiteralPath $packedMsvcp).VersionInfo.FileVersion
     }
+    $toolVer = (Get-Item -LiteralPath $toolMsvcp).VersionInfo.FileVersion
+    $oldV = if ($oldVer) { [version]($oldVer -replace '[^\d\.].*$','') } else { $null }
+    $toolV = [version]($toolVer -replace '[^\d\.].*$','')
 
-    Copy-Item -Force (Join-Path $crtDir.FullName "*.dll") "$packRoot\bin\"
-
-    $newVer = (Get-Item "$packRoot\bin\msvcp140.dll").VersionInfo.FileVersion
-    Write-Host "GMP CRT: bundled msvcp140.dll $oldVer (repo data\redist\crt) -> $newVer ($($crtDir.FullName))"
-    if ($oldVer -and ([version]($oldVer -replace '[^\d\.].*$','')) -gt ([version]($newVer -replace '[^\d\.].*$',''))) {
-        throw "GMP: bundled msvcp140.dll ($oldVer) is newer than the toolset CRT ($newVer) - refusing to downgrade"
+    if ($oldV -and $oldV -gt $toolV) {
+        Write-Warning "GMP CRT: repo msvcp140.dll ($oldVer) is newer than the toolset CRT ($toolVer): keeping the repo copy"
+    }
+    else {
+        Copy-Item -Force (Join-Path $crtDir.FullName "*.dll") "$packRoot\bin\"
+        Write-Host "GMP CRT: bundled msvcp140.dll $oldVer (repo data\redist\crt) -> $toolVer ($($crtDir.FullName))"
     }
 
     # Adding build output
@@ -94,7 +126,7 @@ function Invoke-PackClient {
     Copy-Item -Force -Recurse $binRoot\citizen\*         $packRoot\citizen\
 	
     if ($Context.IS_FIVEM) {
-        Copy-Item -Force $binRoot\FiveM_Diag.exe $packRoot\
+        Copy-Item -Force $binRoot\VMP_Diag.exe $packRoot\
     }
 
     # Adding UI
@@ -109,18 +141,18 @@ function Invoke-PackClient {
 
     # GCI
     if ($Context.PrivateRoot) {
-        if (!$Tools.gci) {
-            throw "No GCI tool"
-        }
+        # if (!$Tools.gci) {
+        #     throw "No GCI tool"
+        # }
 
-        $listFile = [IO.Path]::Combine($Context.PrivateRoot, "gci-list-{0}.txt" -f $Context.ProductName)
+        # $listFile = [IO.Path]::Combine($Context.PrivateRoot, "gci-list-{0}.txt" -f $Context.ProductName)
 
-        if (!(Test-Path $listFile)) {
-            throw "No GCI list found"
-        }
+        # if (!(Test-Path $listFile)) {
+        #     throw "No GCI list found"
+        # }
 
-        & $Tools.gci make -r $packRoot -l $listFile
-        Test-LastExitCode "GCI tool failed"
+        # & $Tools.gci make -r $packRoot -l $listFile
+        # Test-LastExitCode "GCI tool failed"
     }
 
     # Bootstrapper
@@ -130,10 +162,7 @@ function Invoke-PackClient {
     Copy-Item -Force $bootstrapperPath $packRoot\CitizenFX.exe
     Copy-Item -Force $bootstrapperPath $cachesRoot\CitizenFX.exe
 
-    # GMP: the closed Rockstar RGL elevation helper is no longer required/shipped
-    if (Test-Path "$binRoot\RGL-ElevationHelper.exe") {
-        Copy-Item -Force $binRoot\RGL-ElevationHelper.exe $packRoot\
-    }
+    Invoke-Something -Context $Context -PackRoot $packRoot
 
     # upload review jobs will use this compressed bootstrap file
     Remove-Item -Force -ErrorAction ignore $bootstrapperCompressedPath

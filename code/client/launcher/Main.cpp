@@ -35,6 +35,7 @@
 #include "ErrorFormat.Win32.h"
 
 #include <CfxLocale.h>
+#include <CfxSubProcess.h>
 #include <filesystem>
 
 void InitializeDummies();
@@ -126,6 +127,82 @@ void DLLError(DWORD errorCode, std::string_view dllName)
 
 #ifdef LAUNCHER_PERSONALITY_MAIN
 #include "OSChecks.h"
+#endif
+
+#if (defined(GTA_FIVE) || defined(IS_RDR3)) && defined(LAUNCHER_PERSONALITY_MAIN) && !defined(LAUNCHER_PERSONALITY_GAME)
+// Starts the game process (CitizenFX_SubProcess_game_<build>_aslr.bin copied to data\cache\subprocess\) ourselves.
+// In the official client the closed-source adhesive.dll does this inside EarlyMode_Init. This fork has no adhesive, and in the MAIN
+// personality CitizenGame::Launch() only loads CitizenGame.dll and returns - it never runs GTA5 - so without this the launcher just exits.
+// Returns the exit code of the game process, or -1 if it could not be started.
+static int RunGameProcessWithoutAdhesive()
+{
+	auto state = CfxState::Get();
+
+	std::wstring origin = fmt::sprintf(L"game_%d_aslr", xbr::GetGameBuild());
+	std::wstring binName = fmt::sprintf(L"CitizenFX_SubProcess_%s.bin", origin.c_str());
+
+	if (GetFileAttributesW(MakeRelativeCitPath(binName).c_str()) == INVALID_FILE_ATTRIBUTES)
+	{
+		LauncherTrace("game subprocess binary missing (%s)", ToNarrow(binName).c_str());
+		MessageBoxW(nullptr, fmt::sprintf(L"%s was not found next to the launcher.\n\nBuild the game process (CitiLaunch_%s) and copy it next to %s.exe.\n\nDetails: launcher_trace.log", binName.c_str(), origin.c_str(), PRODUCT_NAME).c_str(), PRODUCT_NAME, MB_OK | MB_ICONERROR);
+		return -1;
+	}
+
+	// copies the .bin into data\cache\subprocess\ (only if changed) and returns that path
+	std::wstring exePath = MakeCfxSubProcess(L"GTAProcess.exe", origin);
+
+	if (exePath.find(L"subprocess") == std::wstring::npos || GetFileAttributesW(exePath.c_str()) == INVALID_FILE_ATTRIBUTES)
+	{
+		LauncherTrace("could not prepare game subprocess exe (%s)", ToNarrow(exePath).c_str());
+		MessageBoxW(nullptr, L"Could not prepare the game process executable in data\\cache\\subprocess.\n\nDetails: launcher_trace.log", PRODUCT_NAME, MB_OK | MB_ICONERROR);
+		return -1;
+	}
+
+	// same command line as the launcher (initCommandLine also holds the -bXXXX flag added by XBR_EarlySelect), minus the exe name
+	std::wstring cli = state->initCommandLine[0] ? std::wstring(state->initCommandLine) : std::wstring(GetCommandLineW());
+	size_t argsPos = 0;
+
+	if (!cli.empty() && cli[0] == L'"')
+	{
+		auto endQuote = cli.find(L'"', 1);
+		argsPos = (endQuote == std::wstring::npos) ? cli.size() : endQuote + 1;
+	}
+	else
+	{
+		auto sp = cli.find_first_of(L" \t");
+		argsPos = (sp == std::wstring::npos) ? cli.size() : sp;
+	}
+
+	std::wstring fullCmd = L"\"" + exePath + L"\"" + cli.substr(argsPos);
+
+	STARTUPINFOW si = { sizeof(si) };
+	PROCESS_INFORMATION pi = {};
+
+	// suspended, so gamePid is set before the game process runs (CitizenGame::Launch refuses to run if !IsMasterProcess && !IsGameProcess)
+	if (!CreateProcessW(exePath.c_str(), &fullCmd[0], nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi))
+	{
+		DWORD err = GetLastError();
+		LauncherTrace("CreateProcess for game process failed (0x%08X)", err);
+		MessageBoxW(nullptr, fmt::sprintf(L"Could not start the game process.\n\nError 0x%08x - %s\n\nDetails: launcher_trace.log", HRESULT_FROM_WIN32(err), ToWide(win32::FormatMessage(err)).c_str()).c_str(), PRODUCT_NAME, MB_OK | MB_ICONERROR);
+		return -1;
+	}
+
+	state->gamePid = pi.dwProcessId;
+	LauncherTrace("game process started (pid %lu)", pi.dwProcessId);
+
+	ResumeThread(pi.hThread);
+	CloseHandle(pi.hThread);
+
+	// we must stay alive: the job object (KILL_ON_JOB_CLOSE) would take the game down with us
+	WaitForSingleObject(pi.hProcess, INFINITE);
+
+	DWORD exitCode = 0;
+	GetExitCodeProcess(pi.hProcess, &exitCode);
+	CloseHandle(pi.hProcess);
+
+	LauncherTrace("game process exited (code 0x%08X)", exitCode);
+	return (int)exitCode;
+}
 #endif
 
 int RealMain()
@@ -1040,37 +1117,49 @@ int RealMain()
 #if (defined(GTA_FIVE) || defined(IS_RDR3)) && !defined(LAUNCHER_PERSONALITY_GAME) && defined(LAUNCHER_PERSONALITY_MAIN)
 			if (initState->IsMasterProcess())
 			{
-				// run game mode
-				LauncherTrace("loading CoreRT.dll (EarlyMode)");
-				HMODULE coreRT = LoadLibrary(MakeRelativeCitPath(L"CoreRT.dll").c_str());
+				// official client: the closed-source adhesive.dll starts the game process from EarlyMode_Init, then this process exits.
+				// this fork: no adhesive -> this launcher starts the game process itself and waits for it.
+				// NOTE: only the real adhesive.dll counts. sticky.dll must NOT: EarlyMode_Init only knows how to load "adhesive", so with only sticky it breaks.
+				bool hasAdhesive = GetFileAttributesW(MakeRelativeCitPath(L"adhesive.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
 
-				if (coreRT)
+				if (hasAdhesive)
 				{
-					auto gameProc = (void (*)())GetProcAddress(coreRT, "EarlyMode_Init");
+					LauncherTrace("loading CoreRT.dll (EarlyMode)");
+					HMODULE coreRT = LoadLibrary(MakeRelativeCitPath(L"CoreRT.dll").c_str());
 
-					if (gameProc)
+					if (coreRT)
 					{
-						LauncherTrace("calling EarlyMode_Init");
-						gameProc();
-						LauncherTrace("EarlyMode_Init returned");
+						auto gameProc = (void (*)())GetProcAddress(coreRT, "EarlyMode_Init");
+
+						if (gameProc)
+						{
+							LauncherTrace("calling EarlyMode_Init");
+							gameProc();
+							LauncherTrace("EarlyMode_Init returned");
+						}
+						else
+						{
+							LauncherTrace("EarlyMode_Init export NOT FOUND in CoreRT.dll");
+							MessageBoxW(nullptr, L"CoreRT.dll has no EarlyMode_Init export - the published client build is wrong/incomplete. Re-publish a full build on the server.", PRODUCT_NAME, MB_OK | MB_ICONERROR);
+						}
 					}
 					else
 					{
-						LauncherTrace("EarlyMode_Init export NOT FOUND in CoreRT.dll");
-						MessageBoxW(nullptr, L"CoreRT.dll has no EarlyMode_Init export - the published client build is wrong/incomplete. Re-publish a full build on the server.", PRODUCT_NAME, MB_OK | MB_ICONERROR);
+						DWORD errorCode = GetLastError();
+						DLLError(errorCode, "CoreRT.dll");
 					}
-				}
-				else
-				{
-					DWORD errorCode = GetLastError();
-					DLLError(errorCode, "CoreRT.dll");
+
+					return 0;
 				}
 
+				LauncherTrace("adhesive not present -> starting the game process directly");
+				RunGameProcessWithoutAdhesive();
 				return 0;
 			}
 #endif
 
 			// game launcher initialization
+			LauncherTrace("CitizenGame::Launch");
 			CitizenGame::Launch(gameExecutable);
 		}
 #ifdef IS_LAUNCHER

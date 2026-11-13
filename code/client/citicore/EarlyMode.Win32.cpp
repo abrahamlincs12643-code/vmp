@@ -25,6 +25,13 @@ extern "C" DLL_EXPORT void EarlyMode_Init()
 		// ros-patches:five is not built in this fork (see components/config.lua), so it is not loaded here
 		"adhesive" })
 	{
+		// optional components (e.g. adhesive) may not exist in this build
+		const auto& known = loader->GetKnownComponents();
+		if (known.find(compName) == known.end() && !(std::string_view{ compName } == "adhesive" && known.find("sticky") != known.end()))
+		{
+			continue;
+		}
+
 		fwRefContainer<ComponentData> cliComponent = loader->LoadComponent(compName);
 		components.push_back(cliComponent->CreateInstance(""));
 	}

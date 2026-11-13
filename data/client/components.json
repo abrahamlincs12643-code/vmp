@@ -8,7 +8,6 @@
 	"debug:net",
 	"citizen:game:main",
 	"net",
-	"stronghold",
 	"profiles",
 	"steam",
 	"gta:net:five",
@@ -61,7 +60,6 @@
 	"voip:mumble",
 	"scrbind:base",
 	"citizen:mod-loader:five",
-	"adhesive",
 	"citizen:game:ipc",
 	"fxdk:main",
 	"citizen:devtools"

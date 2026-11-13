@@ -27,6 +27,14 @@
 
 static bool g_initialized;
 
+#ifndef IS_FXSERVER
+// closed-source Cfx components that this fork does not ship. They are optional: when they are missing we run without them.
+static bool IsOptionalComponent(std::string_view name)
+{
+	return name == "stronghold" || name == "adhesive" || name == "sticky" || name == "ros-patches:five" || name == "ros-patches-five";
+}
+#endif
+
 static void LoadDependencies(ComponentLoader* loader, fwRefContainer<ComponentData>& component);
 
 void ComponentLoader::Initialize()
@@ -165,6 +173,24 @@ void ComponentLoader::InitializeWithString(std::string_view cacheBuf)
 #endif
 
 #ifndef IS_FXSERVER
+#ifdef _WIN32
+		// optional components: skip them when their DLL is not present instead of failing to start
+		if (nameWide == L"stronghold" || nameWide == L"adhesive" || nameWide == L"sticky" || nameWide == L"ros-patches-five")
+		{
+			bool present = GetFileAttributesW(MakeRelativeCitPath(nameWide + L".dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+
+			if (!present && nameWide == L"adhesive")
+			{
+				present = GetFileAttributesW(MakeRelativeCitPath(L"sticky.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+			}
+
+			if (!present)
+			{
+				continue;
+			}
+		}
+#endif
+
 		if (nameWide == L"adhesive")
 		{
 			if (launch::IsSDK() || launch::IsSDKGuest())
@@ -281,6 +307,13 @@ static void LoadDependencies(ComponentLoader* loader, fwRefContainer<ComponentDa
 				break;
 			}
 		}
+
+#ifndef IS_FXSERVER
+		if (!match && IsOptionalComponent(dependency.GetString()))
+		{
+			continue;
+		}
+#endif
 
 		if (!match && dependency.GetCategory() != "vendor")
 		{

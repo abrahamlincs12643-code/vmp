@@ -104,9 +104,11 @@ ConHostSvImpl::ConHostSvImpl()
 {
 	// Create application window
 	//ImGui_ImplWin32_EnableDpiAwareness();
-	wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, _T("FXS"), NULL };
+	// GMP: use the "G" icon embedded in FXServer.exe (resource id 1) for the window / taskbar
+	HICON gmpIcon = ::LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(1));
+	wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), gmpIcon, NULL, NULL, NULL, _T("FXS"), gmpIcon };
 	::RegisterClassEx(&wc);
-	hwnd = ::CreateWindow(wc.lpszClassName, _T("VMP.ir Server (VMPServer)"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
+	hwnd = ::CreateWindow(wc.lpszClassName, _T("GMP Server (GMPServer)"), WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
 
 	// Initialize Direct3D
 	if (!CreateDeviceD3D(hwnd))

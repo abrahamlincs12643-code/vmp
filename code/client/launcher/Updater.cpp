@@ -24,6 +24,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "launcher_version.h"
+#include "LauncherTrace.h"
 
 struct cache_t
 {
@@ -62,8 +63,8 @@ public:
 			while (cacheElement)
 			{
 				cache_t cache;
-				cache.name = cacheElement->Attribute("ID");
-				cache.version = atoi(cacheElement->Attribute("Version"));
+				cache.name = cacheElement->Attribute("ID") ? cacheElement->Attribute("ID") : "";
+				cache.version = cacheElement->Attribute("Version") ? atoi(cacheElement->Attribute("Version")) : 0;
 				
 				if (auto child = cacheElement->FirstChild(); child)
 				{
@@ -156,16 +157,29 @@ public:
 		}
 
 		auto rootElement = doc.RootElement();
+
+		if (!rootElement)
+		{
+			return false;
+		}
+
 		auto fileElement = rootElement->FirstChildElement("ContentFile");
 
 		while (fileElement)
 		{
+			// never crash on a malformed manifest entry - skip it
+			if (!fileElement->Attribute("Name") || !fileElement->Attribute("Size") || !fileElement->Attribute("SHA1Hash"))
+			{
+				fileElement = fileElement->NextSiblingElement("ContentFile");
+				continue;
+			}
+
 			manifestFile_t file;
 			file.name = fileElement->Attribute("Name");
 
 			int64_t size, compressedSize, compressedSizeZstd;
 			size = strtoll(fileElement->Attribute("Size"), nullptr, 10);
-			compressedSize = strtoll(fileElement->Attribute("CompressedSize"), nullptr, 10);
+			compressedSize = fileElement->Attribute("CompressedSize") ? strtoll(fileElement->Attribute("CompressedSize"), nullptr, 10) : size;
 			compressedSizeZstd = 0;
 
 			if (auto zstdSize = fileElement->Attribute("CompressedSizeZstd"))
@@ -187,7 +201,7 @@ public:
 
 			if (fileElement->Attribute("SHA256Hash"))
 			{
-				ParseHash(fileElement->Attribute("SHA256Hash"), file.hash256.data());
+				ParseHash(fileElement->Attribute("SHA256Hash"), file.hash256.data(), 32);
 				file.hash256Valid = true;
 			}
 
@@ -235,11 +249,11 @@ public:
 	}
 
 private:
-	void ParseHash(const char* hashString, uint8_t* out)
+	void ParseHash(const char* hashString, uint8_t* out, int maxBytes = 20)
 	{
 		int i = 0;
 
-		while (*hashString)
+		while (hashString[0] && hashString[1] && i < maxBytes)
 		{
 			char hexDigit[3];
 			hexDigit[0] = *hashString;
@@ -350,7 +364,8 @@ bool Updater_RunUpdate(std::initializer_list<std::string> wantedCachesList)
 	}
 #endif
 
-	_wunlink(MakeRelativeCitPath(L"content_index.xml").c_str());
+	// NOTE: content_index.xml is kept (needed for offline verification when the server is down);
+	// it is rewritten after every successful update.
 	shouldVerify = true;
 
 
@@ -432,12 +447,27 @@ bool Updater_RunUpdate(std::initializer_list<std::string> wantedCachesList)
 	std::list<std::tuple<std::string, size_t>> deleteFiles;
 	std::set<std::string> queuedNames;
 
+	// the client manifest can be far larger than the old 128 KB buffer (truncated XML => nothing got verified/downloaded)
+	if (cachesFile.size() < (8 * 1024 * 1024))
+	{
+		cachesFile.resize(8 * 1024 * 1024);
+	}
+
 	for (auto& [localCache, cache] : needsUpdate)
 	{
+		LauncherTrace("fetching manifest %s", cache->manifestUrl.c_str());
 		int result = DL_RequestURL(cache->manifestUrl.c_str(), cachesFile.data(), cachesFile.size());
 
 		manifest_t manifest(cache);
-		manifest.Parse(cachesFile.data());
+
+		if (result != 0 || !manifest.Parse(cachesFile.data()) || manifest.GetFiles().empty())
+		{
+			LauncherTrace("manifest fetch/parse failed (curl %i: %s)", result, DL_RequestURLError());
+			UI_DisplayError(ToWide(va("The client file list (manifest) could not be downloaded or is invalid (%i, %s).\nThe server has no valid client build published. Re-publish the build on the server and try again.", result, DL_RequestURLError())).c_str());
+			return false;
+		}
+
+		LauncherTrace("manifest OK: %zu files", manifest.GetFiles().size());
 		cache->manifest = cachesFile.data();
 
 		// check if we have a valid manifest
@@ -538,7 +568,9 @@ bool Updater_RunUpdate(std::initializer_list<std::string> wantedCachesList)
 
 	UI_UpdateText(0, va(gettext(L"Updating %s..."), PRODUCT_NAME));
 
+	LauncherTrace("verification done, running download loop");
 	bool retval = DL_RunLoop();
+	LauncherTrace("download loop finished: %s", retval ? "ok" : "FAILED/CANCELLED");
 
 	// delete obsolete files
 	// *after* downloading, so if downloading fails we won't break
@@ -834,4 +866,86 @@ const char* GetUpdateChannel()
 
 	return updateChannel.c_str();
 }
+
+bool Updater_VerifyLocal()
+{
+	// read the content index saved by the last successful update
+	FILE* f = _wfopen(MakeRelativeCitPath(L"content_index.xml").c_str(), L"rb");
+
+	if (!f)
+	{
+		UI_DisplayError(L"The update server is not reachable and no local game file index exists yet.\nStart the server (or check your internet) and launch again once to install/verify the client.");
+		return false;
+	}
+
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+
+	std::vector<char> data(len + 1, 0);
+	size_t got = fread(data.data(), 1, len, f);
+	fclose(f);
+	data[got] = '\0';
+
+	cacheFile_t localCacheFile;
+	localCacheFile.Parse(data.data());
+
+	cache_ptr localCache = localCacheFile.GetCache(CONTENT_NAME);
+	manifest_t manifest(localCache);
+
+	if (localCache->manifest.empty() || !manifest.Parse(localCache->manifest.c_str()) || manifest.GetFiles().empty())
+	{
+		UI_DisplayError(L"The update server is not reachable and the local game file index is invalid.\nStart the server and launch again once to repair the client.");
+		return false;
+	}
+
+	UI_DoCreation();
+	UI_UpdateText(0, gettext(L"Verifying content...").c_str());
+
+	uint64_t fileStart = 0;
+	uint64_t fileTotal = 0;
+
+	for (auto& file : manifest.GetFiles())
+	{
+		fileTotal += file.localSize;
+	}
+
+	std::vector<std::string> bad;
+
+	for (auto& file : manifest.GetFiles())
+	{
+		std::array<uint8_t, 20> hashEntry;
+		memcpy(hashEntry.data(), file.hash.data(), hashEntry.size());
+
+		if (CheckFileOutdatedWithUI(MakeRelativeCitPath(ToWide(file.name)).c_str(), { hashEntry }, &fileStart, fileTotal, nullptr, file.localSize))
+		{
+			bad.push_back(file.name);
+		}
+
+		if (UI_IsCanceled())
+		{
+			UI_DoDestruction();
+			return false;
+		}
+	}
+
+	UI_DoDestruction();
+
+	if (!bad.empty())
+	{
+		std::string list;
+		for (size_t i = 0; i < bad.size() && i < 8; i++)
+		{
+			list += "\n - " + bad[i];
+		}
+
+		LauncherTrace("offline verify: %zu bad files", bad.size());
+		UI_DisplayError(ToWide(va("The update server is offline and %zu client file(s) are missing or corrupt:%s\n\nStart the server so the launcher can repair them.", bad.size(), list)).c_str());
+		return false;
+	}
+
+	LauncherTrace("offline verify OK (%zu files)", manifest.GetFiles().size());
+	return true;
+}
+
 #endif

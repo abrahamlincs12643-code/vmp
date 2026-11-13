@@ -66,6 +66,9 @@ HWND UI_GetWindowHandle();
 
 // updater functions
 bool Updater_RunUpdate(std::initializer_list<std::string> wantedCaches);
+
+// offline mode: verify installed client files against the last saved content_index.xml (no server needed)
+bool Updater_VerifyLocal();
 const char* GetUpdateChannel();
 
 #include <array>

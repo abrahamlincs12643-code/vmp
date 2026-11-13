@@ -1030,6 +1030,7 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 	}
 	else
 	{
+		UI_DoDestruction();
 		return true;
 	}
 

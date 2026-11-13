@@ -19,6 +19,7 @@
 #include <HostSharedData.h>
 
 #include <citversion.h>
+#include "LauncherTrace.h"
 
 extern std::string GetObjectURL(std::string_view objectHash, std::string_view suffix = "");
 
@@ -125,8 +126,19 @@ bool Bootstrap_DoBootstrap()
 
 	if (updateDataValid)
 	{
-		int version = std::stoi((*contentHeaders)["x-amz-meta-bootstrap-version"]);
-		int exeSize = std::stoi((*contentHeaders)["x-amz-meta-bootstrap-size"]);
+		int version = 0;
+		int exeSize = 0;
+
+		try
+		{
+			version = std::stoi((*contentHeaders)["x-amz-meta-bootstrap-version"]);
+			exeSize = std::stoi((*contentHeaders)["x-amz-meta-bootstrap-size"]);
+		}
+		catch (const std::exception&)
+		{
+			// header missing/garbage: treat as "no bootstrap update advertised" instead of crashing the launcher
+			LauncherTrace("bootstrap headers missing/invalid");
+		}
 
 		if (version == 0 || exeSize == 0)
 		{
@@ -171,6 +183,13 @@ bool Bootstrap_DoBootstrap()
         return false;
     }
 
+	if (!updateDataValid)
+	{
+		// server unreachable / no build published: still verify the installed files locally, then start anyway
+		LauncherTrace("server not usable -> offline local verification");
+		return Updater_VerifyLocal();
+	}
+
 	if (updateDataValid)
 	{
 		bool rv = false;
@@ -185,6 +204,8 @@ bool Bootstrap_DoBootstrap()
 		{
 			rv = Updater_RunUpdate({ CONTENT_NAME });
 		}
+
+		LauncherTrace("Updater_RunUpdate -> %s", rv ? "ok" : "false");
 
 		if (rv)
 		{

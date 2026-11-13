@@ -6,6 +6,7 @@
  */
 
 #include "StdInc.h"
+#include "LauncherTrace.h"
 #include "CitizenGame.h"
 
 // *NASTY* include path
@@ -220,15 +221,19 @@ int RealMain()
 			static HostSharedData<TickCountData> initTickCount("CFX_SharedTickCount");
 		}
 
+		LauncherTraceInit();
+
 		// run exception handler
 		if (InitializeExceptionServer())
 		{
+			LauncherTrace("InitializeExceptionServer returned true -> exit");
 			return 0;
 		}
 
 		// bootstrap the game
 		if (Bootstrap_RunInit())
 		{
+			LauncherTrace("Bootstrap_RunInit handled command -> exit");
 			return 0;
 		}
 #endif
@@ -410,10 +415,15 @@ int RealMain()
 
 	if (!devMode)
 	{
+		LauncherTrace("Bootstrap_DoBootstrap begin");
+
 		if (!Bootstrap_DoBootstrap())
 		{
+			LauncherTrace("Bootstrap_DoBootstrap returned false -> exit (see error dialog / earlier trace lines)");
 			return 0;
 		}
+
+		LauncherTrace("Bootstrap_DoBootstrap OK");
 	}
 
 	// in case Bootstrap_* didn't set this
@@ -499,10 +509,12 @@ int RealMain()
 
 	if (InitializeExceptionHandler())
 	{
+		LauncherTrace("InitializeExceptionHandler returned true -> exit");
 		return 0;
 	}
 
 	InitLogging();
+	LauncherTrace("InitLogging done");
 
 	// load some popular DLLs as system-wide variants instead of game variants
 	auto systemDlls = {
@@ -583,19 +595,23 @@ int RealMain()
 				// and not a protocol handler
 				if (wcsstr(GetCommandLineW(), initState->GetLinkProtocol(L"://")) == nullptr)
 				{
+					LauncherTrace("not inside job object after assignment -> exit");
 					return 0;
 				}
 			}
 		}
 	}
 
+	LauncherTrace("DoPreLaunchTasks");
 	DoPreLaunchTasks();
 
 	// make sure the game path exists
 	if (auto gamePathExit = EnsureGamePath(); gamePathExit)
 	{
+		LauncherTrace("EnsureGamePath requested exit (%d)", *gamePathExit);
 		return *gamePathExit;
 	}
+	LauncherTrace("EnsureGamePath OK");
 
 	// don't load anything resembling ReShade/ENBSeries *at all* until the game is loading(!)
 	loadSystemDll(L"\\dxgi.dll");
@@ -784,8 +800,11 @@ int RealMain()
 	std::wstring gameExecutable = MakeRelativeGamePath(GAME_EXECUTABLE);
 
 #if defined(GTA_FIVE) || defined(IS_RDR3)
+	LauncherTrace("ExecutablePreload_Init");
 	if (!ExecutablePreload_Init())
 	{
+		LauncherTrace("ExecutablePreload_Init failed -> exit");
+		MessageBoxW(nullptr, L"Could not prepare the game executable (ExecutablePreload failed).\nCheck that GTA V is installed and the path is correct, then restart.\n\nDetails: launcher_trace.log", PRODUCT_NAME, MB_OK | MB_ICONERROR);
 		return 0;
 	}
 #endif
@@ -793,12 +812,17 @@ int RealMain()
 #if (defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)) && (defined(LAUNCHER_PERSONALITY_GAME) || defined(LAUNCHER_PERSONALITY_MAIN))
 	{
 		// ensure game cache is up-to-date, and obtain redirection metadata from the game cache
+		LauncherTrace("UpdateGameCache begin");
 		auto redirectionData = UpdateGameCache();
 
 		if (redirectionData.empty())
 		{
+			LauncherTrace("UpdateGameCache returned EMPTY -> exit");
+			MessageBoxW(nullptr, L"Game file check did not finish (cancelled, a download failed, or a game file is missing).\n\nRestart the launcher and accept the game data update, make sure GTA V is a legitimate full install and the server is reachable.\n\nDetails: launcher_trace.log", PRODUCT_NAME, MB_OK | MB_ICONERROR);
 			return 0;
 		}
+
+		LauncherTrace("UpdateGameCache OK (%zu entries)", redirectionData.size());
 
 		g_redirectionData = redirectionData;
 
@@ -1017,6 +1041,7 @@ int RealMain()
 			if (initState->IsMasterProcess())
 			{
 				// run game mode
+				LauncherTrace("loading CoreRT.dll (EarlyMode)");
 				HMODULE coreRT = LoadLibrary(MakeRelativeCitPath(L"CoreRT.dll").c_str());
 
 				if (coreRT)
@@ -1025,7 +1050,14 @@ int RealMain()
 
 					if (gameProc)
 					{
+						LauncherTrace("calling EarlyMode_Init");
 						gameProc();
+						LauncherTrace("EarlyMode_Init returned");
+					}
+					else
+					{
+						LauncherTrace("EarlyMode_Init export NOT FOUND in CoreRT.dll");
+						MessageBoxW(nullptr, L"CoreRT.dll has no EarlyMode_Init export - the published client build is wrong/incomplete. Re-publish a full build on the server.", PRODUCT_NAME, MB_OK | MB_ICONERROR);
 					}
 				}
 				else

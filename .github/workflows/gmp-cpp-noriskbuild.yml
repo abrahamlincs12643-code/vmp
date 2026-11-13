@@ -448,6 +448,47 @@ jobs:
                   }
               }.GetNewClosure()
 
+              # ---------------------------------------------------------------------
+              # FAIL-FAST: pre-download the V8 12.4 monolith libraries.
+              # Root cause of the old "MSB8066: Custom build for vendor\v8\12.4\tag.txt exited with code 1"
+              # (which only showed up after ~1 hour of MSBuild): vendor\v8\12.4\lib is not tracked by git,
+              # so curl could not create vendor\v8\12.4\lib\v8_monolith.lib. The premake script
+              # (code\vendor\v8-monolith.lua) is fixed too, but doing the download here makes any mirror
+              # or network problem fail in seconds instead of after the long compile.
+              # ---------------------------------------------------------------------
+              Invoke-LogSection 'V8 12.4 monolith pre-download (fail fast)' {
+                  $root = $context.ProjectRoot
+                  $v8Lib = Join-Path $root 'vendor\v8\12.4\lib'
+                  New-Item -ItemType Directory -Force -Path $v8Lib | Out-Null
+                  $target = Join-Path $v8Lib 'v8_monolith.lib'
+                  $mirrors = @(
+                      'https://cdn.vmp.ir/mirrors/vendor/v8/12.4',
+                      'https://content.cfx.re/mirrors/vendor/v8/12.4'
+                  )
+                  $ok = $false
+                  foreach ($m in $mirrors) {
+                      $url = "$m/v8_monolith.lib"
+                      Write-Host "Downloading $url"
+                      & curl.exe --fail --retry 3 --retry-delay 5 --connect-timeout 30 --create-dirs -L -o $target $url
+                      if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $target -PathType Leaf) -and (Get-Item -LiteralPath $target).Length -gt 1MB) {
+                          $ok = $true
+                          Write-Host ("  OK: {0} ({1:N0} bytes)" -f $target, (Get-Item -LiteralPath $target).Length)
+                          break
+                      }
+                      Write-Host "  failed (curl exit code $LASTEXITCODE), trying next mirror..."
+                      Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+                  }
+                  if (-not $ok) {
+                      throw 'Could not download v8_monolith.lib for V8 12.4 from any mirror (cdn.vmp.ir, content.cfx.re). Upload the file to your own mirror or fix the URL list in code\vendor\v8-monolith.lua and this step.'
+                  }
+
+                  # Make sure the pinned V8 headers exist (submodule vendor/v8/12.4/source) before the long build.
+                  $v8Header = Join-Path $root 'vendor\v8\12.4\source\include\v8.h'
+                  if (-not (Test-Path -LiteralPath $v8Header -PathType Leaf)) {
+                      throw "V8 12.4 sources are missing ($v8Header). The submodule vendor/v8/12.4/source was not checked out."
+                  }
+              }.GetNewClosure()
+
               Invoke-LogSection 'Premake project generation' {
                   $root = $context.ProjectRoot
                   $codeDir = Join-Path $root 'code'
@@ -890,6 +931,17 @@ jobs:
           finally {
               Remove-Item -LiteralPath $temporaryBuildScript -Force -ErrorAction SilentlyContinue
           }
+
+      - name: Upload MSBuild error log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: GMP-msbuild-errors-${{ github.run_number }}
+          path: |
+            .build-cache/MSBuild.Errors.log
+            .build-cache/**/MSBuild.Errors.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload GMP.exe
         if: env.GMP_PREMAKE_ONLY != 'true' && env.GMP_UI_ONLY != 'true'

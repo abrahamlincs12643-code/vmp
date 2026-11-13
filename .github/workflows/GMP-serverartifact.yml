@@ -1,0 +1,174 @@
+name: GMP FXServer Windows Build
+
+# Builds ONLY the Windows FXServer (FXServer.exe + citizen/ + system resources) and uploads GMP-fxserver-N.zip
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gmp-fxserver-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-gmp-fxserver:
+    name: Build GMP FXServer (Windows x64 / MSVC)
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    env:
+      CI: 'true'
+      CI_PROJECT_DIR: ${{ github.workspace }}
+      CI_COMMIT_REF_NAME: ${{ github.ref_name }}
+      CI_COMMIT_SHA: ${{ github.sha }}
+      CI_PIPELINE_IID: ${{ github.run_number }}
+      CFX_PRODUCT_NAME: fxserver
+      CFX_DRY_RUN: 'true'
+      CFX_RETAIL_BUILD: 'false'
+      CFX_FEATURE_BRANCH_BUILD: 'false'
+      MSYS2_ROOT: 'C:\msys64'
+
+    steps:
+      - name: Configure Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - name: Checkout GMP source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+          submodules: false
+
+      - name: Set up Python 3.11 for legacy node-gyp
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Pin Python for legacy native addons
+        shell: pwsh
+        env:
+          PYTHON_PATH: ${{ steps.setup-python.outputs.python-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:PYTHON_PATH -c "from distutils.version import StrictVersion"
+          if ($LASTEXITCODE -ne 0) { throw 'Python 3.11 with distutils is required.' }
+          $lines = @("PYTHON=$env:PYTHON_PATH", "NODE_GYP_FORCE_PYTHON=$env:PYTHON_PATH", "npm_config_python=$env:PYTHON_PATH")
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, ($lines -join [Environment]::NewLine) + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+
+      - name: Set up Node.js and Yarn Classic
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Yarn Classic
+        shell: pwsh
+        run: |
+          npm install --global yarn@1.22.22
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install Yarn Classic.' }
+
+      - name: Validate checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in @('.gitmodules','prebuild.cmd','code\premake5.lua','code\tools\ci\premake5.exe','code\tools\ci\vswhere.exe','code\tools\ci\build_server_windows.ps1','code\components\citizen-server-impl\src\ServerAuth.cpp')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $f))) { throw "Missing $f - this is not a full GMP checkout." }
+          }
+
+      - name: Install Windows SDK 10.0.22000.0 (if missing)
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = '10.0.22000.0'
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          $need = @((Join-Path $kits "Include\$v\um\Windows.h"), (Join-Path $kits "Lib\$v\um\x64\kernel32.lib"), (Join-Path $kits "bin\$v\x64\rc.exe"))
+          if (@($need | Where-Object { -not (Test-Path -LiteralPath $_) }).Count -gt 0) {
+            $exe = Join-Path $env:RUNNER_TEMP 'winsdk.exe'
+            Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2173743' -OutFile $exe -MaximumRedirection 10 -TimeoutSec 1800
+            $sig = Get-AuthenticodeSignature -FilePath $exe
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft') { throw 'Windows SDK installer signature check failed.' }
+            $p = Start-Process -FilePath $exe -ArgumentList '/q /norestart /ceip off /features OptionId.DesktopCPPx86 OptionId.DesktopCPPx64' -Wait -PassThru
+            if ($p.ExitCode -notin @(0, 3010)) { throw "Windows SDK installer failed: $($p.ExitCode)" }
+          }
+          $miss = @($need | Where-Object { -not (Test-Path -LiteralPath $_) })
+          if ($miss.Count -gt 0) { throw "Windows SDK incomplete: $($miss -join '; ')" }
+
+      - name: Build FXServer (prebuild, premake, MSBuild, system resources, pack)
+        shell: pwsh
+        working-directory: code/tools/ci
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # `using module` must be at the top of a standalone script file, not inside the YAML step
+          $script = @'
+          using module .\psm1\cfxBuildContext.psm1
+          using module .\psm1\cfxBuildSystemResources.psm1
+          using module .\psm1\cfxBuildTools.psm1
+          using module .\psm1\cfxGitlabSections.psm1
+          using module .\psm1\cfxPackServer.psm1
+          using module .\psm1\cfxRunMSBuild.psm1
+          using module .\psm1\cfxRunPrebuild.psm1
+          using module .\psm1\cfxRunPremake.psm1
+          using module .\psm1\cfxSetupSubmodules.psm1
+          using module .\psm1\cfxSetupVS.psm1
+          using module .\psm1\cfxUpdateVersionFiles.psm1
+          using module .\psm1\cfxVersions.psm1
+
+          $ErrorActionPreference = 'Stop'
+          try {
+              Set-Location $env:CI_PROJECT_DIR
+              $ctx = Get-CfxBuildContext -RequireProductName
+              $tools = Get-CfxBuildTools -Context $ctx
+              $versions = Get-CfxVersions -Context $ctx
+
+              $tools.ensurePython()
+              $tools.ensureNodeJS()
+              $tools.ensureYarn()
+              $ctx.startBuild()
+
+              Invoke-LogSection 'Visual Studio Environment Setup' { Invoke-CfxSetupVS -Context $ctx -Tools $tools }.GetNewClosure()
+              Invoke-LogSection 'Submodules Setup' { Invoke-SetupSubmodules -Context $ctx }.GetNewClosure()
+
+              & git -C $ctx.ProjectRoot submodule update --init --recursive --jobs=8 --force
+              if ($LASTEXITCODE -ne 0) { throw 'Recursive submodule checkout failed.' }
+
+              Invoke-LogSection 'Running prebuild' { Invoke-RunPrebuild -Context $ctx }.GetNewClosure()
+              Invoke-LogSection 'Running premake' { Invoke-RunPremake -Context $ctx -Tools $tools }.GetNewClosure()
+              Invoke-LogSection 'Updating version files' { Invoke-UpdateVersionFiles -Context $ctx -Versions $versions }.GetNewClosure()
+              Invoke-LogSection 'Running MSBuild' { Invoke-RunMSBuild -Context $ctx -Tools $tools }.GetNewClosure()
+              Invoke-LogSection 'Building system resources' { Invoke-BuildSystemResources -Context $ctx -Versions $versions }.GetNewClosure()
+              Invoke-LogSection 'Packing server' { Invoke-PackServer -Context $ctx -Tools $tools }.GetNewClosure()
+
+              $ctx.finishBuild()
+          } catch {
+              Write-Output $_
+              Write-Output 'BUILD FAILED'
+              exit 1
+          }
+          '@
+          $path = Join-Path (Get-Location) 'gmp-build-fxserver.generated.ps1'
+          [System.IO.File]::WriteAllText($path, $script, [System.Text.UTF8Encoding]::new($true))
+          & pwsh -NoProfile -ExecutionPolicy Bypass -File $path
+          if ($LASTEXITCODE -ne 0) { throw "FXServer build failed (exit $LASTEXITCODE)" }
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'out\server.zip')) { throw 'out\server.zip was not produced' }
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: Upload FXServer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GMP-fxserver-${{ github.run_number }}
+          path: |
+            out/server.zip
+            out/server.7z
+          if-no-files-found: error
+          retention-days: 30

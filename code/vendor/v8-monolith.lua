@@ -40,8 +40,27 @@ return {
             ('../vendor/v8/%s/tag.txt'):format(baseVersion)
         }
 
-        local baseURL = ('https://cdn.vmp.ir/mirrors/vendor/v8/%s'):format(baseVersion)
+        -- Mirrors are tried in order; the first one that serves the file wins.
+        local mirrorURLs = {
+            ('https://cdn.vmp.ir/mirrors/vendor/v8/%s'):format(baseVersion),
+            ('https://content.cfx.re/mirrors/vendor/v8/%s'):format(baseVersion),
+        }
         local v8LibDir = (path.getabsolute('../') .. '/vendor/v8/%s/lib'):format(baseVersion)
+
+        -- Builds one "curl A || curl B" command line for cmd.exe.
+        --  * --create-dirs: vendor/v8/<ver>/lib is not tracked by git (only *.lib is ignored there and
+        --    empty folders are not committed), so curl must create it, otherwise it fails with
+        --    "Failed to open the file" (exit 23) and MSBuild reports MSB8066 exit code 1.
+        --  * --fail: never save an HTML error page as a .lib file.
+        --  * -z: re-download only if the server copy is newer than the local file.
+        local function downloadCommand(fileName)
+            local target = ('%s/%s'):format(v8LibDir, fileName)
+            local attempts = {}
+            for _, url in ipairs(mirrorURLs) do
+                table.insert(attempts, ('curl.exe --fail --retry 3 --retry-delay 5 --connect-timeout 30 --create-dirs "-z%s" -L "-o%s" "%s/%s?t=%s"'):format(target, target, url, fileName, os.time()))
+            end
+            return table.concat(attempts, ' || ')
+        end
 
         if os.istarget('windows') then
             filter { "files:**/tag.txt", "configurations:Debug" }
@@ -52,8 +71,9 @@ return {
                 buildcommands {
                     -- download files, redownload only if outdated
                     'echo Pre-build step for downloading v8_monolith libraries',
-                    ('curl.exe "-z%s/%s" -L "-o%s/%s" "%s/%s?t=%s"'):format(v8LibDir, libNameDebug, v8LibDir, libNameDebug, baseURL, libNameDebug, os.time()),
-                    'if %errorlevel% neq 0 (exit /b 1)',
+                    downloadCommand(libNameDebug),
+                    'if %errorlevel% neq 0 (echo ERROR: v8 monolith download failed on every mirror & exit /b 1)',
+                    ('if not exist "%s/%s" (echo ERROR: %s is missing after download & exit /b 1)'):format(v8LibDir, libNameDebug, libNameDebug),
                 }
             filter{}
 
@@ -65,8 +85,9 @@ return {
                 buildcommands {
                     -- download files, redownload only if outdated
                     'echo Pre-build step for downloading v8_monolith libraries',
-                    ('curl.exe "-z%s/%s" -L "-o%s/%s" "%s/%s?t=%s"'):format(v8LibDir, libName, v8LibDir, libName, baseURL, libName, os.time()),
-                    'if %errorlevel% neq 0 (exit /b 1)',
+                    downloadCommand(libName),
+                    'if %errorlevel% neq 0 (echo ERROR: v8 monolith download failed on every mirror & exit /b 1)',
+                    ('if not exist "%s/%s" (echo ERROR: %s is missing after download & exit /b 1)'):format(v8LibDir, libName, libName),
                 }
             filter{}
         end

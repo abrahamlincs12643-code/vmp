@@ -10,8 +10,7 @@
 		"citizen:scripting:v8node",
 		"net:tcp-server",
 		"vendor:bgfx",
-		"citizen:game:ipc",
-		"ros-patches:five"
+		"citizen:game:ipc"
 	],
 	"provides": []
 }

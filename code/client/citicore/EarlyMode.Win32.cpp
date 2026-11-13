@@ -21,9 +21,8 @@ extern "C" DLL_EXPORT void EarlyMode_Init()
 	for (auto compName : {
 #ifdef IS_RDR3
 		"ros-patches:rdr3",
-#else
-		"ros-patches:five",
 #endif
+		// ros-patches:five is not built in this fork (see components/config.lua), so it is not loaded here
 		"adhesive" })
 	{
 		fwRefContainer<ComponentData> cliComponent = loader->LoadComponent(compName);

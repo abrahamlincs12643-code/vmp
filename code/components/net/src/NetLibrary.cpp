@@ -1820,8 +1820,9 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 
 		HttpRequestOptions options;
 		options.addRawBody = true;
+		options.timeoutNoResponse = std::chrono::seconds(15);
 		
-		auto request = m_httpClient->Get(fmt::sprintf("%sinfo.json", url));
+		auto request = m_httpClient->Get(fmt::sprintf("%sinfo.json", url), options);
 		request->OnCompletion([=](bool success, std::string_view data)
 		{
 			using json = nlohmann::json;
@@ -1998,7 +1999,9 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 					}
 				}))
 			{
-				// continueRequest();
+				// GMP: no auth interceptor is registered in this build, so nobody else would ever continue the
+				// connection -> it hung forever on "Requesting server variables...". Continue ourselves.
+				continueRequest();
 			}
 		});
 

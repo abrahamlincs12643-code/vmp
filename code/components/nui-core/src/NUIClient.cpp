@@ -380,7 +380,12 @@ auto NUIClient::OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 		{
 			auto gmpHost = boost::algorithm::to_lower_copy(CefString(&gmpParts.host).ToString());
 
-			if (gmpHost == "frontend.cfx-services.net" || gmpHost == "servers-frontend.fivem.net" || gmpHost == "servers-live.fivem.net" || gmpHost == "servers-frontend.redm.net")
+			auto gmpEndsWith = [&gmpHost](const std::string& suf) { return gmpHost.size() >= suf.size() && gmpHost.compare(gmpHost.size() - suf.size(), suf.size(), suf) == 0; };
+			auto gmpPath = CefString(&gmpParts.path).ToString();
+			bool gmpCfxHost = gmpEndsWith("fivem.net") || gmpEndsWith("cfx-services.net") || gmpEndsWith("redm.net") || gmpEndsWith("cfx.re");
+
+			if (gmpHost == "frontend.cfx-services.net" || gmpHost == "servers-frontend.fivem.net" || gmpHost == "servers-live.fivem.net" || gmpHost == "servers-frontend.redm.net" ||
+				(gmpCfxHost && (gmpPath.find("/api/servers") == 0 || gmpPath.find("/api/upvote") == 0)))
 			{
 				auto gmpOrig = request->GetURL().ToString();
 				auto gmpPos = gmpOrig.find(gmpHost);

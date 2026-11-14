@@ -1828,6 +1828,7 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 			using json = nlohmann::json;
 
 			std::string sv_sessionId;
+			std::string sv_serverId;
 			int authVersion = 1;
 
 			// We got a response way later than we wanted - user has canceled connection or joined another server
@@ -1973,6 +1974,8 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 						sv_sessionId = ival;
 					}
 
+					sv_serverId = info["vars"].value("sv_serverId", "");
+
 					requestSteamTicket = info.value("requestSteamTicket", "on");
 					authVersion = info.value("authVersion", 1);
 				}
@@ -1999,9 +2002,64 @@ concurrency::task<void> NetLibrary::ConnectToServer(const std::string& rootUrl)
 					}
 				}))
 			{
-				// GMP: no auth interceptor is registered in this build, so nobody else would ever continue the
-				// connection -> it hung forever on "Requesting server variables...". Continue ourselves.
-				continueRequest();
+				// GMP: no auth interceptor is registered in this build. Get a signed ticket from the GMP core
+				// (POST <base>cnl/api/ticket/create) and send it as "cfxTicket2" - this is what the server's
+				// initConnect handler verifies ("No authentication ticket was specified." otherwise).
+				OnConnectionProgress("Requesting GMP authentication ticket...", 0, 100, false);
+
+				std::map<std::string, std::string> ticketFields;
+				ticketFields["guid"] = fmt::sprintf("%llu", (unsigned long long)GetGUID());
+				ticketFields["gn"] = postMap["gameName"];
+				ticketFields["si"] = sv_serverId;
+				ticketFields["endpoint"] = url;
+
+				m_httpClient->DoPostRequest(fmt::sprintf("%scnl/api/ticket/create", GMP_JOIN_BASE), ticketFields, [this, continueRequest](bool ok, const char* tdata, size_t tlen)
+				{
+					if (m_connectionState != CS_INITING)
+					{
+						return;
+					}
+
+					std::string ticket;
+					std::string failReason = "GMP core unreachable";
+
+					if (ok)
+					{
+						try
+						{
+							auto tj = nlohmann::json::parse(std::string(tdata, tlen));
+							if (tj.is_object() && tj.contains("ticket") && tj["ticket"].is_string())
+							{
+								ticket = tj["ticket"].get<std::string>();
+							}
+							else if (tj.is_object() && tj.contains("error") && tj["error"].is_string())
+							{
+								failReason = tj["error"].get<std::string>();
+							}
+						}
+						catch (std::exception&)
+						{
+							failReason = "invalid response from GMP core";
+						}
+					}
+					else if (tdata && tlen)
+					{
+						failReason = std::string(tdata, tlen);
+					}
+
+					if (ticket.empty())
+					{
+						OnConnectionError(fmt::sprintf("Failed to get a GMP authentication ticket: %s", failReason), nlohmann::json::object({
+							{ "fault", "either" },
+							{ "action", "#ErrorAction_TryAgainContactOwner" },
+						}).dump());
+						m_connectionState = CS_IDLE;
+						return;
+					}
+
+					postMap["cfxTicket2"] = ticket;
+					continueRequest();
+				});
 			}
 		});
 

@@ -787,7 +787,8 @@ static InitFunction initFunction([]()
 						auto sentServerId = json["si"].get<std::string>();
 
 						auto serverIdVar = instance->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("sv_serverId");
-						if (serverIdVar && sentServerId == serverIdVar->GetValue())
+						// GMP: an unset sv_serverId convar is treated as the empty id (GMP issues tickets with si="" then)
+						if ((serverIdVar && sentServerId == serverIdVar->GetValue()) || (!serverIdVar && sentServerId.empty()))
 						{
 							serverIdMatch = true;
 						}

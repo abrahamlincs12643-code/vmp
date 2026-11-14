@@ -372,6 +372,27 @@ auto NUIClient::OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 		return RV_CANCEL;
 	}
 
+	// GMP: the menu's server list must come from the GMP Core server (licensed servers that are connected to it),
+	// not from the Cfx master list. Rewrite the Cfx list/single/icon/upvote endpoints to our server.
+	{
+		CefURLParts gmpParts;
+		if (CefParseURL(request->GetURL(), gmpParts))
+		{
+			auto gmpHost = boost::algorithm::to_lower_copy(CefString(&gmpParts.host).ToString());
+
+			if (gmpHost == "frontend.cfx-services.net" || gmpHost == "servers-frontend.fivem.net" || gmpHost == "servers-live.fivem.net" || gmpHost == "servers-frontend.redm.net")
+			{
+				auto gmpOrig = request->GetURL().ToString();
+				auto gmpPos = gmpOrig.find(gmpHost);
+
+				if (gmpPos != std::string::npos)
+				{
+					request->SetURL(std::string("http://5.57.35.80:9891") + gmpOrig.substr(gmpPos + gmpHost.size()));
+				}
+			}
+		}
+	}
+
 	// 'code.jquery.com' has reliability concerns for some end users, redirect these to googleapis instead
 	{
 		CefURLParts parts;

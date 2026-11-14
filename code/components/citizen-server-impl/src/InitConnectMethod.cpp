@@ -782,13 +782,22 @@ static InitFunction initFunction([]()
 						}
 					}
 
-					if (json["si"].is_string())
+					if (!json.contains("si") || json["si"].is_null())
+					{
+						// GMP: ticket without a server id
+						serverIdMatch = true;
+					}
+					else if (json["si"].is_string())
 					{
 						auto sentServerId = json["si"].get<std::string>();
 
 						auto serverIdVar = instance->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("sv_serverId");
-						// GMP: an unset sv_serverId convar is treated as the empty id (GMP issues tickets with si="" then)
-						if ((serverIdVar && sentServerId == serverIdVar->GetValue()) || (!serverIdVar && sentServerId.empty()))
+						// GMP: the ticket is RSA-signed by the GMP core and bound to the player's GUID + expiry, so the server id
+						// is only a soft binding here. The client reads sv_serverId from /info.json (ServerInfo convars only), so a
+						// server that used "set sv_serverId" (not "sets") or left it unset would otherwise always fail with (4).
+						// Only reject when BOTH sides carry a non-empty id and they differ.
+						std::string serverIdValue = serverIdVar ? serverIdVar->GetValue() : std::string{};
+						if (sentServerId.empty() || serverIdValue.empty() || sentServerId == serverIdValue)
 						{
 							serverIdMatch = true;
 						}

@@ -1074,7 +1074,10 @@ namespace fx
 				}
 			}
 
-			sendHttpHeartbeat(kDefaultServerList, isPrivate);
+			// GMP: the GMP core list is always a public listing. "isPrivate" only matters for third-party HTTP masters;
+			// with "sv_master1 ''" (or any non-default master) it used to stay true and the GMP core hid the server
+			// from the launcher's server list.
+			sendHttpHeartbeat(kDefaultServerList, false);
 			m_nextHeartbeatTime = msec() + 3min;
 		}
 
